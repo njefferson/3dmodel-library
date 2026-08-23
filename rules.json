@@ -14,6 +14,11 @@
   "match_filenames": true,
   "_comment_match_filenames": "When true (the default) the names of the model files inside a folder are used as a FALLBACK for anything the folder path did not match - so a kit in a folder called 'KitA' full of warhound_titan_*.stl still gets found. The path always wins where it matches; filenames never overrule it. Set to false for path-only matching.",
 
+  "thumbnail_style": {
+    "_comment": "How rendered thumbnails look. 'preset' picks one of slate, paper, blueprint, bronze, mono, resin - try them with: python update_catalog.py --sample 6 --style blueprint. Any of background, model, ambient, specular, rim, rim_color set here overrides that preset.",
+    "preset": "slate"
+  },
+
   "categories": {
     "_comment": "Checked in order. First match wins. 'wargaming' is checked after the specific ones below it are ruled out.",
     "Printer utilities": "calibrat|firmware|bed level|bed_level|filament guide|filament_guide|ender|prusa|geeetech|duet|klipper|octoprint|\\bmount\\b|cooling|fan duct|nozzle|z-?offset|test print|benchy|xyz cube|temp tower|retraction",

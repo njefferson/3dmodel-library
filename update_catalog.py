@@ -54,6 +54,24 @@ ARCH={".zip",".rar",".7z"}
 def stable_id(p): return hashlib.sha1(p.strip().lower().replace("/","\\").encode("utf-8","ignore")).hexdigest()[:16]
 
 # ---------- writing the catalog: never leave a half-written file behind ----------
+def atomic_write_bytes(path, data):
+    """Same guarantee as atomic_write, for binary. A thumbnail matters because
+    render_missing treats the mere EXISTENCE of a .webp as "already done" — so a
+    half-written one from a Ctrl+C would be accepted as finished for good."""
+    d=os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(d, exist_ok=True)
+    fd,tmp=tempfile.mkstemp(dir=d, prefix=".tmp-", suffix="-"+os.path.basename(path))
+    os.close(fd)
+    try:
+        with open(tmp,"wb") as fp:
+            fp.write(data); fp.flush(); os.fsync(fp.fileno())
+        os.replace(tmp,path)
+        tmp=None
+    finally:
+        if tmp and os.path.exists(tmp):
+            try: os.remove(tmp)
+            except OSError: pass
+
 def atomic_write(path, text, encoding="utf-8"):
     """Write to a temp file in the same folder, then os.replace() it into position.
     os.replace is atomic on Windows and POSIX alike, so a Ctrl+C or a crash midway
@@ -265,6 +283,54 @@ def classify(path, name, files=None):
     return cat, faction, src, tags+["type:"+t for t in types]
 
 
+# ---------- how a rendered thumbnail looks ----------
+# Every colour and light level the mesh renderer uses. Pick one with --style, or
+# override any single value under "thumbnail_style" in rules.json.
+THUMB_PRESETS={
+ "slate":     {"background":"#20242c","model":"#c6cddf","ambient":0.34,"specular":0.10,"rim":0.05},
+ "paper":     {"background":"#eeece7","model":"#a9a396","ambient":0.48,"specular":0.08,"rim":0.03},
+ "blueprint": {"background":"#0d1b2a","model":"#79aed6","ambient":0.30,"specular":0.14,"rim":0.08},
+ "bronze":    {"background":"#1b1712","model":"#bc8848","ambient":0.32,"specular":0.16,"rim":0.07},
+ "mono":      {"background":"#111111","model":"#d0d0d0","ambient":0.30,"specular":0.09,"rim":0.06},
+ "resin":     {"background":"#1a1d24","model":"#9ad3c1","ambient":0.36,"specular":0.12,"rim":0.07},
+}
+DEFAULT_STYLE="slate"
+_STYLE_NAME=None          # set by --style; propagated to the render workers
+VIEW_ELEV,VIEW_AZIM=26,-58
+
+def _hex(c, fallback=(0.8,0.83,0.9)):
+    try:
+        h=str(c).strip().lstrip("#")
+        if len(h)==3: h="".join(ch*2 for ch in h)
+        return tuple(int(h[i:i+2],16)/255.0 for i in (0,2,4))
+    except Exception:
+        return fallback
+
+def _hexstr(c, fallback="#20242c"):
+    h=str(c).strip()
+    return h if re.fullmatch(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})", h) else fallback
+
+def style_names():
+    return sorted(THUMB_PRESETS)
+
+def _style():
+    """Resolved look for one render: a named preset, with anything set under
+    rules.json's "thumbnail_style" laid over the top."""
+    R=rules().get("thumbnail_style")
+    R=R if isinstance(R,dict) else {}
+    name=(_STYLE_NAME or R.get("preset") or DEFAULT_STYLE)
+    st=dict(THUMB_PRESETS.get(str(name).strip().lower(), THUMB_PRESETS[DEFAULT_STYLE]))
+    for k in ("background","model","ambient","specular","rim","rim_color"):
+        if k in R: st[k]=R[k]
+    out={"background_hex":_hexstr(st.get("background")),
+         "background_rgb":tuple(int(round(x*255)) for x in _hex(st.get("background"),(0.125,0.14,0.17))),
+         "model":_hex(st.get("model")),
+         "rim_rgb":_hex(st.get("rim_color","#ffffff"),(1.0,1.0,1.0))}
+    for k in ("ambient","specular","rim"):
+        try: out[k]=max(0.0,min(2.0,float(st.get(k,THUMB_PRESETS[DEFAULT_STYLE][k]))))
+        except (TypeError,ValueError): out[k]=THUMB_PRESETS[DEFAULT_STYLE][k]
+    return out
+
 # ---------- rendering (host-native paths, no mount translation) ----------
 class TO(Exception): pass
 # Per-render timeout via SIGALRM is Unix-only; on Windows it's unavailable, so
@@ -311,40 +377,88 @@ def _render(model_paths, out_path, timeout=0):
             return (False, load_err or f"no loadable geometry in {len(model_paths)} file(s)")
         mesh=trimesh.util.concatenate(meshes) if len(meshes)>1 else meshes[0]
         v=np.asarray(mesh.vertices,dtype=float); f=np.asarray(mesh.faces)
-        CAP=16000
-        if len(f)>CAP:
+        note=None
+        # RENDER_CAP was 16,000, which was costing far more than it saved: measured
+        # on a 114k-face mesh, matplotlib draws the lot in 0.66s against 0.16s for
+        # 16k — under a second, on a job where loading the STL takes several. The
+        # low cap was the main reason sculpts came out faceted.
+        if len(f)>RENDER_CAP:
             reduced=False
-            try:                              # best: real quadric decimation -> solid surface
-                dm=mesh.simplify_quadric_decimation(CAP)
-                if len(getattr(dm,"faces",[]))>0:
-                    v=np.asarray(dm.vertices,dtype=float); f=np.asarray(dm.faces); reduced=True
-            except Exception:
-                reduced=False
-            if not reduced:                   # direct fast-simplification (real decimation, solid)
+            for attempt in ("trimesh","fast_simplification"):
                 try:
-                    import fast_simplification as _fs
-                    vv,ff=_fs.simplify(np.asarray(mesh.vertices,dtype=np.float32),
-                                       np.asarray(mesh.faces,dtype=np.int32), target_count=CAP)
-                    if len(ff)>0: v=np.asarray(vv,dtype=float); f=np.asarray(ff); reduced=True
+                    if attempt=="trimesh":
+                        dm=mesh.simplify_quadric_decimation(RENDER_CAP)
+                        nv,nf=np.asarray(dm.vertices,dtype=float),np.asarray(dm.faces)
+                    else:
+                        import fast_simplification as _fs
+                        vv,ff=_fs.simplify(np.asarray(mesh.vertices,dtype=np.float32),
+                                           np.asarray(mesh.faces,dtype=np.int32),
+                                           target_count=RENDER_CAP)
+                        nv,nf=np.asarray(vv,dtype=float),np.asarray(ff)
+                    if len(nf)>0: v,f,reduced=nv,nf,True; break
                 except Exception:
-                    reduced=False
-            if not reduced:                   # last resort: stride (keeps adjacent faces)
-                step=int(np.ceil(len(f)/CAP)); f=f[::step]
+                    continue
+            # Striding keeps every Nth triangle, which does not simplify a surface —
+            # it scatters it into loose specks. It used to run whenever no decimator
+            # was installed, and since trimesh's own quadric decimation ALSO needs
+            # fast-simplification, that was every high-poly model on a default
+            # install. Now it is only ever used to keep a genuinely enormous mesh
+            # inside memory, and it says so.
+            if not reduced and len(f)>HARD_CAP:
+                step=int(np.ceil(len(f)/HARD_CAP)); f=f[::step]
+                note=("too big to reduce without fast-simplification; drawn from every "
+                      f"{step}th triangle — run: pip install fast-simplification")
         # tight, robust framing: center on the bulk's bounding box, fill the frame,
         # and match the box aspect so thin/elongated parts don't render as a speck.
         lo=np.percentile(v,1,axis=0); hi=np.percentile(v,99,axis=0)
         ctr=(lo+hi)/2.0; v=v-ctr; half=(hi-lo)/2.0
         half=np.where(half<=0,1e-6,half)
+        # Smooth shading. matplotlib paints each polygon ONE colour and cannot
+        # interpolate across it, so the only thing that can vary smoothly is the
+        # shading field — one averaged normal per face instead of its own flat one.
+        # That needs consistent winding first: downloaded STLs are full of reversed
+        # faces, and two opposite normals meeting at a vertex cancel to nothing.
+        # (An earlier attempt oriented faces away from the centre instead, which is
+        # wrong for anything that is not star-shaped — on a torus the inner surface
+        # points inward, and it came out banded.)
+        sn=None
+        try:
+            tm=trimesh.Trimesh(vertices=v, faces=f, process=False)
+            tm.fix_normals()
+            f=np.asarray(tm.faces)
+            vnorm=np.asarray(tm.vertex_normals,dtype=float)
+            if vnorm.shape==v.shape and np.isfinite(vnorm).all():
+                sn=vnorm[f].mean(axis=1)
+        except Exception:
+            sn=None
         tri=v[f]
-        n=np.cross(tri[:,1]-tri[:,0],tri[:,2]-tri[:,0]); ln=np.linalg.norm(n,axis=1); ln[ln==0]=1; n=n/ln[:,None]
-        # Two-sided lighting. Downloaded STLs very often have flipped or
-        # inconsistent normals; using |n.L| instead of clipping at 0 means a
-        # backwards-wound face lights identically to a correct one, so those
-        # patchy black facets disappear. Second light fills the shadow side.
+        fn=np.cross(tri[:,1]-tri[:,0],tri[:,2]-tri[:,0])
+        flen=np.linalg.norm(fn,axis=1)
+        fn=fn/np.where(flen==0,1.0,flen)[:,None]
+        if sn is None:
+            sn=fn                          # no consistent winding: flat, as before
+        else:
+            slen=np.linalg.norm(sn,axis=1)
+            sn=sn/np.where(slen==0,1.0,slen)[:,None]
+            sn[slen<0.35]=fn[slen<0.35]    # cancelled out: keep the hard edge
+        # Two-sided lighting: |n.L| rather than clipping at 0, so a face that is
+        # still wound backwards lights like a correct one instead of going black.
+        st=_style()
         L=np.array([.3,.4,.86]);   L=L/np.linalg.norm(L)
         L2=np.array([-.55,-.35,.4]); L2=L2/np.linalg.norm(L2)
-        shade=np.clip(0.34+0.54*np.abs(n@L)+0.18*np.abs(n@L2),0,1)
-        base=np.array([.80,.83,.90]); col=np.zeros((len(f),4)); col[:,:3]=np.clip(base*shade[:,None],0,1); col[:,3]=1
+        e,a=np.radians(VIEW_ELEV),np.radians(VIEW_AZIM)
+        V=np.array([np.cos(e)*np.cos(a), np.cos(e)*np.sin(a), np.sin(e)])
+        H=L+V; H=H/np.linalg.norm(H)
+        key=np.abs(sn@L)
+        diff=np.clip(st["ambient"]+0.54*key+0.18*np.abs(sn@L2),0,1)
+        # Specular is gated on the key light: an unlit face must not sprout a
+        # highlight, and a broad sheen just clips large flat faces to white.
+        spec=st["specular"]*np.power(np.abs(sn@H),48)*key
+        rim=st["rim"]*np.power(np.clip(1.0-np.abs(sn@V),0,1),4)*key
+        base=np.array(st["model"]); rimc=np.array(st["rim_rgb"])
+        col=np.zeros((len(f),4))
+        col[:,:3]=np.clip(base[None,:]*diff[:,None]+spec[:,None]+rim[:,None]*rimc[None,:],0,1)
+        col[:,3]=1
         fig=plt.figure(figsize=(5.12,5.12),dpi=100); ax=fig.add_subplot(111,projection="3d")
         ax.add_collection3d(Poly3DCollection(tri,facecolors=col,edgecolors="none",linewidths=0))
         pad=1.06
@@ -353,10 +467,11 @@ def _render(model_paths, out_path, timeout=0):
         ax.set_box_aspect(tuple(asp))
         try: ax.set_proj_type("ortho")
         except Exception: pass
-        ax.view_init(26,-58); ax.set_axis_off()
-        fig.patch.set_facecolor("#20242c"); ax.set_facecolor("#20242c"); fig.subplots_adjust(0,0,1,1)
-        buf=io.BytesIO(); fig.savefig(buf,format="png",facecolor="#20242c"); plt.close(fig); buf.seek(0)
-        _save_webp(Image.open(buf), out_path); _alarm(0); return (True,None)
+        ax.view_init(VIEW_ELEV,VIEW_AZIM); ax.set_axis_off()
+        bg=st["background_hex"]
+        fig.patch.set_facecolor(bg); ax.set_facecolor(bg); fig.subplots_adjust(0,0,1,1)
+        buf=io.BytesIO(); fig.savefig(buf,format="png",facecolor=bg); plt.close(fig); buf.seek(0)
+        _save_webp(Image.open(buf), out_path); _alarm(0); return (True,note)
     except TO:
         _alarm(0); return (False,"timeout")
     except MemoryError:
@@ -381,8 +496,14 @@ def _save_webp(im, out_path, edge=512, ceiling=200000):
     q=85
     while q>=35:
         b=io.BytesIO(); im.save(b,"WEBP",quality=q,method=4)
-        if b.tell()<=ceiling or q==35: open(out_path,"wb").write(b.getvalue()); return
+        if b.tell()<=ceiling or q==35:
+            atomic_write_bytes(out_path, b.getvalue()); return
         q-=10
+
+# Faces we will happily draw, and the point past which memory matters more than
+# looks. Between the two we simply draw everything.
+RENDER_CAP=120000
+HARD_CAP=250000
 
 PREVIEW_HINT=re.compile(r"render|preview|thumb|_prev|display|promo|cover|hero|showcase",re.I)
 
@@ -575,13 +696,14 @@ def _icon_guard(img, repeat_limit=3):
     n=_ICON_SEEN.get(h,0)+1; _ICON_SEEN[h]=n
     return n < repeat_limit
 
-def _shell_thumb(src_path, out_path, size=512, bg=(32,36,44)):
+def _shell_thumb(src_path, out_path, size=512, bg=None):
     """Render a thumbnail via Windows' own shell handler (Explorer). Fast + cached.
     Returns True on success, False if unavailable/failed (caller falls back to mesh)."""
     try:
         import pythoncom, ctypes
         from win32com.shell import shell
         from PIL import Image
+        if bg is None: bg=_style()["background_rgb"]
         try: pythoncom.CoInitialize()
         except Exception: pass
         sii=shell.SHCreateItemFromParsingName(src_path, None, shell.IID_IShellItemImageFactory)
@@ -647,15 +769,19 @@ def _thumb_for(it, out_path, engine="shell"):
     if engine!="mesh" and best and _shell_thumb(best, out_path): return ("shell",None)
     ok,why=_render(renderable, out_path, timeout=_TIMEOUT)
     if ok:
-        # rendered, but say so if it is only part of the kit
-        return ("mesh", f"rendered from {len(renderable)} of {len(renderable)+cloud+gone} part(s)"
-                        if (cloud or gone) else None)
+        # rendered — but say so if it is only part of the kit, or was reduced crudely
+        bits=[]
+        if cloud or gone:
+            bits.append(f"rendered from {len(renderable)} of {len(renderable)+cloud+gone} part(s)")
+        if why: bits.append(why)
+        return ("mesh", "; ".join(bits) or None)
     return ("timeout" if why=="timeout" else "failed", why)
 
 _ENGINE="shell"
 _TIMEOUT=0.0            # seconds a single render may take; 0 = no limit
-def _init_worker(engine, timeout=0.0):
-    global _ENGINE,_TIMEOUT; _ENGINE=engine; _TIMEOUT=timeout
+def _init_worker(engine, timeout=0.0, style=None):
+    global _ENGINE,_TIMEOUT,_STYLE_NAME
+    _ENGINE=engine; _TIMEOUT=timeout; _STYLE_NAME=style
 
 def render_one(it):
     """Pool worker. Uses the module-global engine (set via pool initializer). Never raises."""
@@ -835,7 +961,7 @@ def _render_pool(targets, jobs, engine, timeout, on_done, on_progress=None, pool
     import multiprocessing as mp
     def default_factory():
         return mp.Pool(jobs, initializer=_init_worker,
-                       initargs=(engine, max(5.0, timeout*0.9) if timeout else 0.0))
+                       initargs=(engine, max(5.0, timeout*0.9) if timeout else 0.0, _STYLE_NAME))
     make=pool_factory or default_factory
     pool=make(); pending=list(targets); inflight={}
     finished=0; timed_out=0; restarted=0
@@ -1738,6 +1864,7 @@ def main():
     ap.add_argument("--rebuild-views",action="store_true",help="regenerate catalog.csv/json, gallery.html and the import file from existing data — no rendering")
     ap.add_argument("--max-mb",type=float,default=1500,metavar="MB",help="skip projects larger than this (default 1500). Use a huge number to include everything.")
     ap.add_argument("--timeout",type=float,default=300,metavar="SECONDS",help="give up on any single model after this long and move on (default 300; 0 = no limit)")
+    ap.add_argument("--style",choices=style_names(),default=None,help="colour scheme for rendered thumbnails (default: slate, or whatever rules.json sets)")
     ap.add_argument("--compare-engines",type=int,default=0,metavar="N",help="render N SMALL models with BOTH engines side by side into _engine_test/ (fast; changes nothing else)")
     ap.add_argument("--prune",action="store_true",help="remove catalog entries whose files no longer exist (after move-detection runs)")
     ap.add_argument("--relocate",action="store_true",help="re-check every entry's path and fix ones that moved (no scan, no rendering)")
@@ -1751,6 +1878,8 @@ def main():
     ap.add_argument("--unmatched",nargs="?",type=int,const=25,default=0,metavar="N",help="list entries no rule matched, with the part names inside them, to help write patterns")
     a=ap.parse_args()
     _ensure_dirs()
+    if a.style:
+        global _STYLE_NAME; _STYLE_NAME=a.style
     jobs = a.jobs if a.jobs>0 else min(6, max(1,(os.cpu_count() or 2)-1))
     if a.restore_backup is not None:
         restore_backup(a.restore_backup or None); return
@@ -1864,6 +1993,7 @@ Or use these directly:
   --sample 8                 preview 8 thumbnails into _render_test/
 Useful extras:  --jobs N (cores)   --max-mb N (skip huge)   --engine shell|mesh
                 --timeout N (give up on one model after N seconds, default 300)
+                --style NAME   (slate | paper | blueprint | bronze | mono | resin)
 """.strip()); return
     added=updated=0
     print("\nScanning reads names and sizes only — nothing is opened, so nothing gets\n"

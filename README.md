@@ -99,6 +99,7 @@ back.
 - `--max-mb N` — skip projects bigger than this (default 1500)
 - `--timeout N` — give up on any single model after N seconds and move on (default 300; `0` = no limit)
 - `--engine shell|mesh` — thumbnail engine (see below)
+- `--style NAME` — colour scheme for rendered thumbnails: `slate` (default), `paper`, `blueprint`, `bronze`, `mono`, `resin`
 
 **When things move or go wrong**
 
@@ -112,7 +113,9 @@ back.
 
 ## Two thumbnail engines
 
-**`mesh`** (reliable, default in the menu) renders the geometry with trimesh + matplotlib. A couple of seconds per model. Install `fast-simplification` for noticeably cleaner output on high-poly sculpts.
+**`mesh`** (reliable, default in the menu) renders the geometry with trimesh + matplotlib. A couple of seconds per model.
+
+`fast-simplification` is **required**, not optional, despite what its old comment said: trimesh's own `simplify_quadric_decimation()` is built on top of it, so without it *both* reduction paths fail and a high-poly sculpt falls back to keeping every Nth triangle — which scatters the surface into loose specks instead of simplifying it. If you see speckled thumbnails, that is why.
 
 **`shell`** (Windows only) asks Windows for the same thumbnail Explorer shows. Near-instant when it works — but it depends entirely on whether you have an STL thumbnail handler installed, and on some machines it fails for every file. The tool detects that and falls back to `mesh` automatically. It also rejects the case where Windows hands back the same generic icon for everything.
 
@@ -133,6 +136,20 @@ top of the page. Nothing is skipped silently.
 - **unsupported** — `.step`/`.stp`, which nothing here can convert
 - **failed** — the renderer ran and produced nothing; the reason is recorded alongside it
 - **timeout** — the render ran past `--timeout` and the worker was killed
+
+## How thumbnails look
+
+Surfaces are shaded from averaged vertex normals rather than per-face ones, so a curved model reads as curved instead of as a bag of flat plates. (matplotlib paints each polygon a single colour and cannot interpolate across one, so the shading *field* is what has to vary — true Gouraud shading is not available here at any face count.) Winding is made consistent first, because downloaded STLs are full of reversed faces and two opposite normals meeting at a vertex cancel out.
+
+Six colour schemes ship: `slate` (default), `paper`, `blueprint`, `bronze`, `mono`, `resin`. Try one before committing to a full re-render:
+
+```bash
+python update_catalog.py --sample 6 --style blueprint
+```
+
+Then apply it with `--thumbs-only --force --style blueprint`. Set `"preset"` under `thumbnail_style` in `rules.json` to make a choice stick, and override `background`, `model`, `ambient`, `specular`, `rim` or `rim_color` individually there if you want something of your own.
+
+Note that changing the look means re-rendering everything, which is the slowest thing this tool does.
 
 ## Cloud storage (Dropbox, OneDrive, Google Drive)
 

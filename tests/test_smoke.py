@@ -405,6 +405,95 @@ class TestRenderTimeout(unittest.TestCase):
         self.assertEqual(uc._TIMEOUT, 0.0)
 
 
+try:
+    import numpy, trimesh          # noqa: F401
+    import matplotlib; matplotlib.use("Agg")
+    HAVE_RENDER = True
+except Exception:
+    HAVE_RENDER = False
+
+
+class TestThumbnailStyle(unittest.TestCase):
+
+    def tearDown(self):
+        uc._STYLE_NAME = None
+
+    def test_colours_parse_in_both_notations(self):
+        self.assertEqual(uc._hex("#ffffff"), (1.0, 1.0, 1.0))
+        self.assertEqual(uc._hex("#000"), (0.0, 0.0, 0.0))
+        self.assertEqual(uc._hex("nonsense"), (0.8, 0.83, 0.9))      # falls back
+        self.assertEqual(uc._hexstr("javascript:x"), "#20242c")
+
+    def test_every_preset_is_complete_and_sane(self):
+        for name in uc.style_names():
+            uc._STYLE_NAME = name
+            st = uc._style()
+            for key in ("background_hex", "model", "ambient", "specular", "rim", "rim_rgb"):
+                self.assertIn(key, st, f"{name} is missing {key}")
+            self.assertRegex(st["background_hex"], r"^#[0-9a-fA-F]{6}$")
+            self.assertTrue(all(0.0 <= c <= 1.0 for c in st["model"]))
+            self.assertLessEqual(st["ambient"] + st["specular"] + st["rim"], 1.0,
+                                 f"{name} can clip to white before diffuse is added")
+
+    def test_the_style_flag_beats_the_rules_file(self):
+        uc._STYLE_NAME = "bronze"
+        self.assertEqual(uc._style()["background_hex"],
+                         uc.THUMB_PRESETS["bronze"]["background"])
+
+    def test_an_unknown_name_falls_back_rather_than_crashing(self):
+        uc._STYLE_NAME = "chartreuse-nightmare"
+        self.assertEqual(uc._style()["background_hex"],
+                         uc.THUMB_PRESETS[uc.DEFAULT_STYLE]["background"])
+
+
+@unittest.skipUnless(HAVE_RENDER, "needs numpy/trimesh/matplotlib")
+class TestRendering(unittest.TestCase):
+    """These actually draw. The stride fallback used to run on every high-poly model
+    on a default install, and it does not simplify a surface — it scatters it."""
+
+    def setUp(self):
+        import trimesh
+        self.tmp = tempfile.mkdtemp(prefix="3dlib-render-")
+        s = trimesh.creation.icosphere(subdivisions=5, radius=1.0)
+        self.path = os.path.join(self.tmp, "hp.stl")
+        s.export(self.path)
+        self.faces = len(s.faces)
+
+    def tearDown(self):
+        uc._STYLE_NAME = None
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_a_mesh_under_the_hard_cap_is_never_strided(self):
+        self.assertLess(self.faces, uc.HARD_CAP)
+        out = os.path.join(self.tmp, "out.webp")
+        ok, note = uc._render([self.path], out)
+        self.assertTrue(ok)
+        self.assertIsNone(note, "fell back to striding when it did not need to")
+        self.assertGreater(os.path.getsize(out), 0)
+
+    def test_each_style_actually_changes_the_picture(self):
+        shots = {}
+        for name in ("slate", "paper", "bronze"):
+            uc._STYLE_NAME = name
+            out = os.path.join(self.tmp, name + ".webp")
+            ok, _ = uc._render([self.path], out)
+            self.assertTrue(ok)
+            with open(out, "rb") as fp: shots[name] = fp.read()
+        self.assertEqual(len(set(shots.values())), 3, "styles produced identical images")
+
+    def test_inconsistent_winding_still_renders(self):
+        """Downloaded STLs are full of reversed faces; that must not black them out."""
+        import trimesh, numpy as np
+        m = trimesh.load(self.path, force="mesh")
+        f = np.asarray(m.faces).copy()
+        rng = np.random.default_rng(1); bad = rng.random(len(f)) < 0.4
+        f[bad] = f[bad][:, ::-1]
+        p = os.path.join(self.tmp, "scrambled.stl")
+        trimesh.Trimesh(vertices=m.vertices, faces=f, process=False).export(p)
+        ok, note = uc._render([p], os.path.join(self.tmp, "scrambled.webp"))
+        self.assertTrue(ok)
+
+
 class TestTicker(unittest.TestCase):
 
     def test_it_fires_on_a_timer_with_nothing_happening(self):
@@ -499,6 +588,19 @@ class TestCatalogSurvivesInterruption(LibraryCase):
                 uc.atomic_write(path, "half a file")
         self.assertEqual(read(path), before)
         self.assertFalse([f for f in os.listdir(self.lib) if f.startswith(".tmp-")])
+
+    def test_an_interrupted_thumbnail_write_leaves_no_half_file(self):
+        """render_missing treats the existence of a .webp as proof it is done, so a
+        truncated one would be accepted as finished for ever."""
+        from PIL import Image
+        target = os.path.join(self.lib, "thumbnails", "half.webp")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with mock.patch("os.replace", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                uc._save_webp(Image.new("RGB", (64, 64), (10, 10, 10)), target)
+        self.assertFalse(os.path.exists(target), "a partial thumbnail was left behind")
+        self.assertFalse([f for f in os.listdir(os.path.dirname(target))
+                          if f.startswith(".tmp-")])
 
     def test_a_corrupt_catalog_is_explained_and_can_be_restored(self):
         self.scan()
