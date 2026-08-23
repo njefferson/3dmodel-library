@@ -273,9 +273,11 @@ _HAS_ALARM = hasattr(signal, "SIGALRM")
 if _HAS_ALARM:
     signal.signal(signal.SIGALRM, lambda s,f:(_ for _ in ()).throw(TO()))
 def _alarm(n):
+    """Unix-only graceful timeout. On Windows this does nothing at all, which is why
+    the parent process enforces a deadline of its own — see _render_pool()."""
     if _HAS_ALARM:
-        signal.alarm(n)
-def _render(model_paths, out_path, timeout=25):
+        signal.alarm(max(0,int(n)))
+def _render(model_paths, out_path, timeout=0):
     """Render one thumbnail from a list of mesh files.
     Returns (True, None) or (False, reason). The reason used to be discarded, which
     is why a project that never got a picture gave no clue why - a missing library,
@@ -397,6 +399,7 @@ def _iter_dirs(root):
     followed, exactly as os.walk(followlinks=False) behaved.
     Yields (dirpath, [DirEntry for the files in it], unreadable_so_far)."""
     stack=[str(root)]; unreadable=0
+    skip_dirs=_ignored_dirs(); skip_pre=_ignored_prefixes()
     while stack:
         d=stack.pop()
         files=[]
@@ -405,10 +408,12 @@ def _iter_dirs(root):
                 for e in it:
                     try:
                         if e.is_dir():
+                            if e.name.strip().lower() in skip_dirs: continue
                             if not e.is_symlink(): stack.append(e.path)
                             continue
                     except OSError:
                         continue
+                    if e.name.startswith(skip_pre): continue
                     files.append(e)
         except OSError:
             unreadable+=1
@@ -416,6 +421,36 @@ def _iter_dirs(root):
         yield d, files, unreadable
 
 _WANTED=MODEL|IMG|ARCH
+# Never real models, always noise in the catalog. __MACOSX/._* are the resource
+# forks a Mac leaves inside a zip; the rest are system folders. Override with
+# "ignore_folders" / "ignore_file_prefixes" in rules.json.
+_IGNORE_DIRS={"__macosx",".git",".svn","$recycle.bin","system volume information",
+              ".trashes","#recycle",".dropbox.cache",".tmp.driveupload"}
+_IGNORE_PREFIXES=("._",)
+
+def _ignored_dirs():
+    R=rules(); v=R.get("ignore_folders")
+    if isinstance(v,list): return {str(x).strip().lower() for x in v if isinstance(x,str)}
+    return _IGNORE_DIRS
+
+def _ignored_prefixes():
+    R=rules(); v=R.get("ignore_file_prefixes")
+    if isinstance(v,list): return tuple(str(x) for x in v if isinstance(x,str))
+    return _IGNORE_PREFIXES
+
+def _is_ignored_path(path):
+    """True if any folder on the way to this path is one we never index."""
+    bad=_ignored_dirs()
+    return any(seg.strip().lower() in bad
+               for seg in str(path).replace("/","\\").split("\\") if seg)
+
+def drop_ignored(by_id):
+    """Remove entries that live inside an ignored folder. A rescan alone cannot do
+    this — merging only adds and updates — so junk catalogued before the rule
+    existed would stay for good."""
+    gone=[k for k,v in by_id.items() if _is_ignored_path(v.get("path",""))]
+    for k in gone: by_id.pop(k,None)
+    return len(gone)
 _PROGRESS_EVERY=2.0     # seconds between "still going" lines
 _STALL_NOTICE=60.0      # after this long with nothing finishing, say so
 
@@ -610,7 +645,7 @@ def _thumb_for(it, out_path, engine="shell"):
         except OSError: continue
         if sz>bestsz: bestsz=sz; best=p
     if engine!="mesh" and best and _shell_thumb(best, out_path): return ("shell",None)
-    ok,why=_render(renderable, out_path)
+    ok,why=_render(renderable, out_path, timeout=_TIMEOUT)
     if ok:
         # rendered, but say so if it is only part of the kit
         return ("mesh", f"rendered from {len(renderable)} of {len(renderable)+cloud+gone} part(s)"
@@ -618,8 +653,9 @@ def _thumb_for(it, out_path, engine="shell"):
     return ("timeout" if why=="timeout" else "failed", why)
 
 _ENGINE="shell"
-def _init_worker(engine):
-    global _ENGINE; _ENGINE=engine
+_TIMEOUT=0.0            # seconds a single render may take; 0 = no limit
+def _init_worker(engine, timeout=0.0):
+    global _ENGINE,_TIMEOUT; _ENGINE=engine; _TIMEOUT=timeout
 
 def render_one(it):
     """Pool worker. Uses the module-global engine (set via pool initializer). Never raises."""
@@ -775,9 +811,80 @@ class _Ticker:
     def __enter__(self): return self.start()
     def __exit__(self, *exc): self.stop()
 
-def render_missing(items, checkpoint=None, force=False, jobs=1, engine="shell", max_mb=1500):
+_POOL_POLL=0.05
+
+def _render_pool(targets, jobs, engine, timeout, on_done, on_progress=None, pool_factory=None):
+    """Render in a worker pool with a deadline the PARENT enforces.
+
+    A per-render timeout used to be signal.SIGALRM, which does not exist on Windows,
+    so on the machine this tool is actually for there was no timeout at all: one
+    corrupt or enormous mesh stalled a worker for good, and with it the whole run.
+
+    multiprocessing.Pool cannot cancel a task once a worker has started it, so the
+    only way to end one is to kill the pool. That is what happens here: each item is
+    submitted individually with at most one in flight per worker (so submission time
+    really is start time), and if one passes its deadline the pool is terminated, the
+    offender is recorded as a timeout, whatever else was in flight goes back on the
+    queue, and a fresh pool picks up where this one left off.
+
+    Workers also get an alarm of their own set slightly earlier, so on Unix a render
+    bows out cleanly and the parent never has to swing the hammer.
+
+    Returns (timed_out, restarted_renders). pool_factory exists so the tests can
+    drive this loop without real processes."""
+    import multiprocessing as mp
+    def default_factory():
+        return mp.Pool(jobs, initializer=_init_worker,
+                       initargs=(engine, max(5.0, timeout*0.9) if timeout else 0.0))
+    make=pool_factory or default_factory
+    pool=make(); pending=list(targets); inflight={}
+    finished=0; timed_out=0; restarted=0
+    try:
+        while pending or inflight:
+            while pending and len(inflight)<jobs:
+                it=pending.pop(0)
+                inflight[pool.apply_async(render_one,(it,))]=(it,time.time())
+            moved=False
+            for ar in list(inflight):
+                it,started=inflight[ar]
+                if ar.ready():
+                    del inflight[ar]
+                    try: pid,status,detail=ar.get(0)
+                    except Exception as e:
+                        pid,status,detail=it["id"],"failed",f"{type(e).__name__}: {e}"[:160]
+                    finished+=1; moved=True
+                    on_done(pid,status,detail)
+                    if on_progress: on_progress(finished)
+                elif timeout and time.time()-started>timeout:
+                    waited=time.time()-started
+                    others=[i for (i,_s) in inflight.values() if i is not it]
+                    try:
+                        pool.terminate(); pool.join()
+                    except Exception: pass
+                    inflight.clear()
+                    finished+=1; timed_out+=1; restarted+=len(others); moved=True
+                    on_done(it["id"],"timeout",
+                            f"no result after {_dur(waited)}; the worker was killed")
+                    note=(f" {len(others)} other render(s) in progress were restarted."
+                          if others else "")
+                    print(f"  [!] gave up on {_short(it.get('path',''),2)} after "
+                          f"{_dur(waited)}.{note}", flush=True)
+                    pending=others+pending
+                    pool=make()
+                    if on_progress: on_progress(finished)
+                    break
+            if not moved: time.sleep(_POOL_POLL)
+    finally:
+        try:
+            pool.terminate(); pool.join()
+        except Exception: pass
+    return timed_out, restarted
+
+def render_missing(items, checkpoint=None, force=False, jobs=1, engine="shell", max_mb=1500,
+                   timeout=300.0):
     _ensure_dirs()
-    global _ENGINE; _ENGINE=engine   # used by the serial path (render_one reads it)
+    global _ENGINE,_TIMEOUT          # used by the in-process path (render_one reads them)
+    _ENGINE=engine; _TIMEOUT=max(5.0,timeout*0.9) if timeout else 0.0
     idmap={it["id"]:it for it in items if it.get("type")=="project"}
     targets=[]; pending_total=0
     for it in items:
@@ -803,7 +910,7 @@ def render_missing(items, checkpoint=None, force=False, jobs=1, engine="shell", 
         it["thumb_status"]="too_big"
         it["thumb_error"]=f"{it.get('size_bytes',0)/1e6:.0f} MB, over the {max_mb:.0f} MB limit"
     total=len(targets); cloud=pending_total-total-len(deferred)
-    jobs=max(1,int(jobs))
+    jobs=max(1,min(int(jobs),total or 1))
     missing_lib=_mesh_libs_missing()
     if missing_lib:
         # The old code rendered nothing and printed "0 ok" without ever saying why.
@@ -814,8 +921,11 @@ def render_missing(items, checkpoint=None, force=False, jobs=1, engine="shell", 
               f"(run with --max-mb 99999 to include them).", flush=True)
     print(f"  {pending_total} projects need a thumbnail; {total} downloaded & renderable now, "
           f"{cloud} not renderable yet{' (FORCE re-render)' if force else ''}.", flush=True)
-    print(f"  Rendering with {jobs} core(s), engine='{engine}'. Safe to press Ctrl+C anytime —", flush=True)
-    print("  finished thumbnails are kept and re-running resumes where it stopped.\n", flush=True)
+    print(f"  Rendering with {jobs} core(s), engine='{engine}', "
+          f"{('giving up on any one model after '+_dur(timeout)) if timeout else 'no time limit per model'}.",
+          flush=True)
+    print("  Safe to press Ctrl+C anytime — finished thumbnails are kept and", flush=True)
+    print("  re-running resumes where it stopped.\n", flush=True)
     done=0; failed=0; t0=time.time(); seen=set(); eta=_Eta(targets)
     last_finish=[t0]
     def report():
@@ -835,26 +945,34 @@ def render_missing(items, checkpoint=None, force=False, jobs=1, engine="shell", 
             else: it.pop("thumb_error",None)
             if status in OK_STATUS: it["thumbnail"]=pid+".webp"; done+=1
             else: failed+=1
+    def _ck(k):
+        if checkpoint and (k%150==0 or k==50):
+            checkpoint()
+            print("   [gallery.html refreshed — you can open it now]", flush=True)
+    timed_out=restarted=0
     ticker.start()
     try:
-        if jobs>1 and total:
+        if total:
+            # One worker or six, it goes through the pool: that is the only place a
+            # render can be given a deadline the parent can actually enforce.
             try:
-                import multiprocessing as mp
-                with mp.Pool(jobs, initializer=_init_worker, initargs=(engine,)) as pool:
-                    for k,(pid,status,detail) in enumerate(pool.imap_unordered(render_one, targets, chunksize=1),1):
-                        apply(pid,status,detail)
-                        if checkpoint and (k%150==0 or k==50):
-                            checkpoint()
-                            print("   [gallery.html refreshed — you can open it now]", flush=True)
+                timed_out,restarted=_render_pool(targets, jobs, engine, timeout, apply, _ck)
             except Exception as e:
-                print(f"  [multi-core unavailable ({type(e).__name__}: {e}); continuing on a single core]\n", flush=True)
-        left=[it for it in targets if it["id"] not in seen]
-        for it in left:
-            pid,status,detail=render_one(it); apply(pid,status,detail)
-            if checkpoint and done and done%100==0: checkpoint()
+                print(f"  [no worker pool available ({type(e).__name__}: {e}); rendering in "
+                      f"this process instead]", flush=True)
+                if timeout and not _HAS_ALARM:
+                    print("      NOTE: the per-model time limit cannot be enforced this way on "
+                          "Windows.\n      A stuck model will stall the run; Ctrl+C and lower "
+                          "--max-mb if that happens.", flush=True)
+                for it in [i for i in targets if i["id"] not in seen]:
+                    pid,status,detail=render_one(it); apply(pid,status,detail); _ck(len(seen))
     finally:
         ticker.stop()
     if total: ticker.emit()
+    if timed_out:
+        print(f"\n  {timed_out} model(s) hit the {_dur(timeout)} limit and were abandoned"
+              + (f"; {restarted} other render(s) were restarted as a result" if restarted else "")
+              + ".\n  Raise it with --timeout, or skip the big ones with --max-mb.", flush=True)
     print(f"\n  finished: {done}/{total} rendered in {time.time()-t0:.0f}s"
           f"{f', {failed} could not be rendered' if failed else ''}", flush=True)
     print_status_summary(items)
@@ -1619,6 +1737,7 @@ def main():
     ap.add_argument("--engine",choices=["shell","mesh"],default="shell",help="thumbnail engine: 'shell' = fast Windows handler like Explorer (default), 'mesh' = slow Python renderer")
     ap.add_argument("--rebuild-views",action="store_true",help="regenerate catalog.csv/json, gallery.html and the import file from existing data — no rendering")
     ap.add_argument("--max-mb",type=float,default=1500,metavar="MB",help="skip projects larger than this (default 1500). Use a huge number to include everything.")
+    ap.add_argument("--timeout",type=float,default=300,metavar="SECONDS",help="give up on any single model after this long and move on (default 300; 0 = no limit)")
     ap.add_argument("--compare-engines",type=int,default=0,metavar="N",help="render N SMALL models with BOTH engines side by side into _engine_test/ (fast; changes nothing else)")
     ap.add_argument("--prune",action="store_true",help="remove catalog entries whose files no longer exist (after move-detection runs)")
     ap.add_argument("--relocate",action="store_true",help="re-check every entry's path and fix ones that moved (no scan, no rendering)")
@@ -1703,7 +1822,8 @@ def main():
     if a.thumbs_only:
         def _ckpt():
             write_catalog(by_id); write_gallery(by_id)   # gallery is browsable mid-run
-        n=render_missing(list(by_id.values()), checkpoint=_ckpt, force=a.force, jobs=jobs, engine=a.engine, max_mb=a.max_mb)
+        n=render_missing(list(by_id.values()), checkpoint=_ckpt, force=a.force, jobs=jobs,
+                         engine=a.engine, max_mb=a.max_mb, timeout=a.timeout)
         write_catalog(by_id)
         print("refreshing gallery.html and print-tracker-import.json ...", flush=True)
         write_gallery(by_id); write_import(by_id)
@@ -1743,6 +1863,7 @@ Or use these directly:
   --restore-backup           put the newest backups/ copy back as catalog.json
   --sample 8                 preview 8 thumbnails into _render_test/
 Useful extras:  --jobs N (cores)   --max-mb N (skip huge)   --engine shell|mesh
+                --timeout N (give up on one model after N seconds, default 300)
 """.strip()); return
     added=updated=0
     print("\nScanning reads names and sizes only — nothing is opened, so nothing gets\n"
@@ -1757,6 +1878,8 @@ Useful extras:  --jobs N (cores)   --max-mb N (skip huge)   --engine shell|mesh
                 if k in by_id: by_id[k].update(v); updated+=1
                 else: by_id[k]=v; added+=1
     print(f"merged: {added} new, {updated} updated")
+    junk=drop_ignored(by_id)
+    if junk: print(f"  dropped {junk} entr(ies) inside folders we never index (__MACOSX and friends)")
     print("checking for entries whose folder moved ...", flush=True)
     moved,dropped,deduped,kept=relocate_and_prune(by_id, prune=a.prune)
     if moved: print(f"  relocated {moved} moved project(s) — thumbnail kept, no re-render")
@@ -1764,7 +1887,7 @@ Useful extras:  --jobs N (cores)   --max-mb N (skip huge)   --engine shell|mesh
     if dropped: print(f"  pruned {dropped} entr(ies) whose files no longer exist")
     if kept: print(f"  left {kept} entr(ies) alone — the folder they live under is not reachable")
     n=render_missing(list(by_id.values()), checkpoint=lambda: write_catalog(by_id),
-                     jobs=jobs, engine=a.engine, max_mb=a.max_mb)
+                     jobs=jobs, engine=a.engine, max_mb=a.max_mb, timeout=a.timeout)
     write_catalog(by_id)
     print("refreshing gallery.html and print-tracker-import.json ...", flush=True)
     write_gallery(by_id); write_import(by_id)

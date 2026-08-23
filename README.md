@@ -97,6 +97,7 @@ back.
 - `--compare-engines 6` — render 6 small models with both engines, side by side
 - `--jobs N` — render workers (default: about half your cores)
 - `--max-mb N` — skip projects bigger than this (default 1500)
+- `--timeout N` — give up on any single model after N seconds and move on (default 300; `0` = no limit)
 - `--engine shell|mesh` — thumbnail engine (see below)
 
 **When things move or go wrong**
@@ -131,7 +132,7 @@ top of the page. Nothing is skipped silently.
 - **too_big** — over `--max-mb`, deliberately deferred
 - **unsupported** — `.step`/`.stp`, which nothing here can convert
 - **failed** — the renderer ran and produced nothing; the reason is recorded alongside it
-- **timeout** — the render was cut off. Unix only for now, since the timeout uses `SIGALRM`
+- **timeout** — the render ran past `--timeout` and the worker was killed
 
 ## Cloud storage (Dropbox, OneDrive, Google Drive)
 
@@ -186,7 +187,7 @@ The included `.gitignore` excludes all of it, plus `sources.txt` and `backups/`.
 
 ## Known limitations
 
-- **No per-render timeout on Windows.** `SIGALRM` is Unix-only, so a corrupt or gigantic mesh can still stall a worker indefinitely there. `--max-mb` limits the blast radius. This is the next thing to fix.
+- Killing a stuck render means killing the worker pool, so anything else being rendered at that moment is restarted from scratch. Rare, and the alternative was one bad model stalling the whole run.
 - `.step`/`.stp` files are catalogued but not thumbnailed — no CAD converter is bundled. They are reported as `unsupported` rather than left blank.
 - `.zip` archives are indexed by name only. Nothing is extracted.
 - Classification is keyword-based, so it is approximate. It reads the folder path first and the filenames inside as a fallback; it never opens a file to see what the model actually is. Edit `rules.json`, check with `--unmatched`, and apply with `--reclassify`.

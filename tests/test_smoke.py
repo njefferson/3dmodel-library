@@ -118,6 +118,33 @@ class TestOutputs(LibraryCase):
         self.assertIn("0 new", out)
         self.assertEqual(before, {i["id"]: i["path"] for i in self.catalog()["items"]})
 
+    def test_mac_resource_forks_are_not_catalogued_as_models(self):
+        """A zip made on a Mac carries __MACOSX/._name.stl alongside every real file.
+        Those were being indexed as projects and then failing to render."""
+        junk = os.path.join(self.models, "Some Kit", "__MACOSX")
+        os.makedirs(junk)
+        write_stl(os.path.join(junk, "._body.stl"))
+        self.add_kit("Some Kit", ["body.stl"])
+        self.add_kit("Another Kit", ["._sneaky.stl", "real.stl"])
+        self.scan()
+        paths = [p["path"] for p in self.projects()]
+        self.assertFalse([p for p in paths if "__MACOSX" in p], "indexed a resource-fork folder")
+        another = [p for p in self.projects() if p["path"].endswith("Another Kit")][0]
+        self.assertEqual(another["model_files"], ["real.stl"], "indexed a ._ resource fork")
+
+    def test_junk_already_in_the_catalog_is_dropped_on_the_next_scan(self):
+        self.scan()
+        cat = json.loads(read(os.path.join(self.lib, "catalog.json")))
+        stale = dict(cat["items"][0])
+        stale["id"] = "deadbeefdeadbeef"
+        stale["path"] = os.path.join(self.models, "Old Kit", "__MACOSX")
+        cat["items"].append(stale)
+        with open(os.path.join(self.lib, "catalog.json"), "w", encoding="utf-8") as fp:
+            json.dump(cat, fp)
+        out = self.scan()
+        self.assertIn("never index", out)
+        self.assertNotIn("deadbeefdeadbeef", read(os.path.join(self.lib, "catalog.json")))
+
     @unittest.skipIf(sys.platform == "win32", "these characters are illegal in Windows paths")
     def test_markup_in_a_folder_name_cannot_break_the_gallery(self):
         """The names come off somebody's disk, so the page has to survive them.
@@ -276,6 +303,106 @@ class TestProgressKeepsTalking(LibraryCase):
         finally:
             uc._PROGRESS_EVERY, uc._STALL_NOTICE = 2.0, 60.0
         self.assertIn("nothing finished for", buf.getvalue())
+
+
+class FakeResult:
+    """A pool result that becomes ready after a set number of polls — or never."""
+    def __init__(self, value=None, ready_after=0, never=False):
+        self.value = value; self.left = ready_after; self.never = never
+    def ready(self):
+        if self.never: return False
+        if self.left > 0: self.left -= 1; return False
+        return True
+    def get(self, timeout=None): return self.value
+
+
+class FakePool:
+    """hang_ids never finish. slow_ids do not finish on their first attempt but do on
+    the retry, which is what an item that was in flight when the pool died looks
+    like. attempts is shared across pools so the retry can be told apart."""
+    def __init__(self, hang_ids, slow_ids, attempts):
+        self.hang = hang_ids; self.slow = slow_ids; self.attempts = attempts
+        self.terminated = False; self.submitted = []
+    def apply_async(self, fn, args):
+        it = args[0]; self.submitted.append(it["id"])
+        self.attempts[it["id"]] = self.attempts.get(it["id"], 0) + 1
+        if it["id"] in self.hang: return FakeResult(never=True)
+        if it["id"] in self.slow and self.attempts[it["id"]] == 1:
+            return FakeResult(never=True)
+        return FakeResult((it["id"], "mesh", None))
+    def terminate(self): self.terminated = True
+    def join(self): pass
+
+
+class TestRenderTimeout(unittest.TestCase):
+    """SIGALRM is Unix-only, so on Windows there was no per-render timeout at all and
+    one corrupt mesh stalled the run for good. Pool cannot cancel a running task, so
+    the parent enforces the deadline and restarts the pool."""
+
+    def items(self, n):
+        return [{"id": f"{i:016x}", "type": "project", "size_bytes": 1000 * (i + 1),
+                 "path": f"/kits/kit{i}", "model_files": ["a.stl"]} for i in range(n)]
+
+    def run_pool(self, items, hang, slow, jobs=3, timeout=0.15):
+        pools = []; attempts = {}
+        def factory():
+            p = FakePool(hang, slow, attempts); pools.append(p); return p
+        seen = {}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            timed_out, restarted = uc._render_pool(
+                items, jobs, "mesh", timeout,
+                lambda pid, st, detail: seen.__setitem__(pid, (st, detail)),
+                pool_factory=factory)
+        return seen, pools, timed_out, restarted, buf.getvalue()
+
+    def test_a_stuck_render_is_abandoned_and_the_rest_still_finish(self):
+        items = self.items(5)
+        stuck = items[2]["id"]
+        seen, pools, timed_out, restarted, out = self.run_pool(items, {stuck}, set())
+        self.assertEqual(len(seen), 5, "not every item was accounted for")
+        self.assertEqual(seen[stuck][0], "timeout")
+        self.assertIn("worker was killed", seen[stuck][1])
+        for it in items:
+            if it["id"] != stuck:
+                self.assertEqual(seen[it["id"]][0], "mesh")
+        self.assertEqual(timed_out, 1)
+        self.assertGreaterEqual(len(pools), 2, "the pool was never restarted")
+        self.assertTrue(pools[0].terminated, "the stuck pool was not killed")
+        self.assertIn("gave up on", out)
+
+    def test_renders_in_flight_alongside_it_are_requeued_not_lost(self):
+        """Killing the pool takes the innocent with it, so they go back on the queue."""
+        items = self.items(4)
+        stuck = items[0]["id"]
+        caught = [items[1]["id"], items[2]["id"]]          # in flight when it is killed
+        seen, pools, timed_out, restarted, out = self.run_pool(items, {stuck}, set(caught))
+        self.assertEqual(seen[stuck][0], "timeout")
+        self.assertGreaterEqual(len(pools), 2)
+        for cid in caught:
+            self.assertIn(cid, pools[1].submitted, "an in-flight render was dropped")
+            self.assertEqual(seen[cid][0], "mesh", "a requeued render never completed")
+        self.assertEqual(len(seen), 4, "not every item was accounted for")
+        self.assertEqual(restarted, len(caught))
+        self.assertIn("restarted", out)
+
+    def test_no_deadline_means_no_killing(self):
+        """--timeout 0 restores the old behaviour: wait as long as it takes. (Which
+        is why this one is given nothing that hangs — with no deadline, nothing
+        would ever end it.)"""
+        items = self.items(3)
+        seen, pools, timed_out, restarted, out = self.run_pool(items, set(), set(), timeout=0)
+        self.assertEqual(len(seen), 3)
+        self.assertEqual(timed_out, 0)
+        self.assertEqual(len(pools), 1)
+        self.assertNotIn("gave up", out)
+
+    def test_workers_are_given_an_alarm_that_fires_before_the_parent_gives_up(self):
+        """On Unix the render should bow out cleanly rather than be killed."""
+        uc._init_worker("mesh", 90.0)
+        self.assertEqual(uc._TIMEOUT, 90.0)
+        uc._init_worker("mesh", 0.0)
+        self.assertEqual(uc._TIMEOUT, 0.0)
 
 
 class TestTicker(unittest.TestCase):
