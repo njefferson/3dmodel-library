@@ -100,11 +100,9 @@ def source_tag(path):
         if p.lower().startswith(r.lower()+"\\") or p.lower()==r.lower():
             if best is None or len(r)>len(best): best=r
     if best:
-        rest=p[len(best):].strip("\\").split("\\")
-        top=os.path.basename(best) or best
-        if rest and rest[0] and len(rest)>1:
-            return f"{top}/{rest[0]}"[:60]
-        return top
+        # The scanned folder's own name. (The first subfolder under it is already
+        # surfaced separately as "collection", so repeating it here just adds noise.)
+        return os.path.basename(best) or best
     seg=[s for s in p.split("\\") if s]
     return seg[-2] if len(seg)>1 else (seg[0] if seg else "unknown")
 
@@ -609,7 +607,12 @@ def _display_fields(path):
         while j<len(segs)-1 and segs[j].strip().lower() in gen: j+=1
         if j<len(segs): col=segs[j]
     start=ri+1 if ri>=0 else max(1,len(segs)-3)
-    crumb=segs[start:len(segs)-1]
+    crumb=[]
+    for s in segs[start:len(segs)-1]:
+        low=s.strip().lower()
+        if low==display.strip().lower(): continue          # don't echo the title back
+        if crumb and low==crumb[-1].strip().lower(): continue   # collapse repeats
+        crumb.append(s)
     return (display, col or "(none)", " › ".join(crumb[-3:]))
 
 def write_gallery(by_id):
@@ -724,7 +727,10 @@ function render(){
    const thumb=d.t?`<img loading="lazy" src="thumbnails/${d.t}">`:`<div class="ph">${d.p?'\\u{1F4E6} packed .zip':'no thumbnail yet'}</div>`;
    const fac=d.f?`<span class="tag fac">${d.f}</span>`:"";
    const types=(d.tags||[]).map(t=>`<span class="tag">${t.replace('type:','')}</span>`).join("");
-   const crumb=d.bc?`<div class="crumb" title="${d.path}">${d.col&&d.col!=="(none)"?d.col+" › ":""}${d.bc}</div>`:`<div class="crumb" title="${d.path}">${d.col||""}</div>`;
+   // only show the collection if it isn't just the item's own name repeated
+   const colTxt=(d.col&&d.col!=="(none)"&&d.col.toLowerCase()!==d.n.toLowerCase())?d.col:"";
+   const crumbTxt=[colTxt,d.bc].filter(Boolean).join(" › ");
+   const crumb=crumbTxt?`<div class="crumb" title="${d.path}">${crumbTxt}</div>`:"";
    c.innerHTML=`<div class="thumb">${thumb}<span class="badge">${d.p?'zip':d.pc+'p'}</span></div>
    <div class="body"><div class="nm" title="${d.path}">${d.n}</div>${crumb}
    <div class="meta"><span class="tag">${d.c}</span>${fac}<span class="tag">${d.s}</span>${types}<span class="tag">${d.mb}MB</span></div>
