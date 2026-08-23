@@ -255,6 +255,42 @@ class TestReclassify(LibraryCase):
         self.assertEqual(cats["Ork Nob"], "Everything else")
         self.assertTrue(all("faction:" not in t for p in self.projects() for t in p["tags"]))
 
+    def test_filenames_classify_a_folder_whose_name_says_nothing(self):
+        """The whole point of looking inside: the folder is called KitA, but every
+        part in it is a warhound titan."""
+        self.add_kit("KitA", ["warhound_titan_body.stl", "warhound_titan_leg.stl"])
+        self.scan()
+        kit = [p for p in self.projects() if p["path"].endswith("KitA")][0]
+        self.assertEqual(kit["faction"], "Knights & Titans")
+        self.assertIn("type:titan", kit["tags"])
+
+    def test_a_filename_cannot_overrule_a_folder_that_already_matched(self):
+        """A part called wall_mount.stl must not turn an Ork kit into printer bits."""
+        self.add_kit("Ork Boyz", ["ork_boy.stl", "wall_mount.stl"])
+        self.scan()
+        kit = [p for p in self.projects() if p["path"].endswith("Ork Boyz")][0]
+        self.assertEqual(kit["faction"], "Orks")
+        self.assertEqual(kit["category"], "Warhammer 40k / wargaming")
+
+    def test_filename_matching_can_be_switched_off(self):
+        self.add_kit("KitA", ["warhound_titan_body.stl"])
+        with open(os.path.join(self.lib, "rules.local.json"), "w", encoding="utf-8") as fp:
+            rules = json.loads(read(os.path.join(self.lib, "rules.json")))
+            rules["match_filenames"] = False
+            json.dump(rules, fp)
+        importlib.reload(uc)
+        self.scan()
+        kit = [p for p in self.projects() if p["path"].endswith("KitA")][0]
+        self.assertIsNone(kit["faction"])
+
+    def test_unmatched_lists_names_but_never_absolute_paths(self):
+        self.add_kit("Something Nobody Named", ["widget.stl"])
+        self.scan()
+        out = self.run_cli("--unmatched")
+        self.assertIn("Something Nobody Named", out)
+        self.assertIn("widget.stl", out)
+        self.assertNotIn(self.models, out, "--unmatched leaked an absolute path")
+
     def test_reclassifying_against_unchanged_rules_is_a_no_op(self):
         self.scan()
         out = self.run_cli("--reclassify")

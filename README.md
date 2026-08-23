@@ -58,6 +58,7 @@ On Windows you can skip the commands entirely — double-click **`LIBRARY.bat`**
 ```
 BROWSE           1  gallery          2  spreadsheet
 CHECK (safe)     3  status           4  scanned folders   5  test 6 thumbnails
+                14  what the rules missed
 PICTURES         6  make missing     7  redo all
 FOLDERS/FILES    8  add folder       9  stop scanning    10  find new files
                 11  fix moved       12  remove dead entries
@@ -84,6 +85,7 @@ back.
 - `--rebuild-views` — regenerate gallery, CSV and JSON from what's already known; no rendering
 - `--reclassify` — re-apply `rules.json` to everything already catalogued
 - `--reclassify --dry-run` — show exactly what that would change, and write nothing
+- `--unmatched 25` — list what no rule recognised, with the part names inside, to help write patterns
 
 **Pictures**
 
@@ -141,7 +143,17 @@ Items are identified by a fingerprint of their contents (the set of model filena
 
 ## Configuring the rules
 
-`rules.json` holds every keyword pattern used for categories, factions, types, and sources. It ships tuned for Warhammer 40k because that's what it was built against — set `"factions": {}` and rewrite `categories` if you catalog something else entirely. Patterns are ordinary case-insensitive regular expressions matched against each item's folder path and name.
+`rules.json` holds every keyword pattern used for categories, factions, types, and sources. It ships tuned for Warhammer 40k because that's what it was built against — set `"factions": {}` and rewrite `categories` if you catalog something else entirely. Patterns are ordinary case-insensitive regular expressions.
+
+**What gets matched.** The folder path and name first. If that matches nothing, the names of the model files *inside* the folder are tried as a fallback — so a kit in a folder called `KitA` full of `warhound_titan_*.stl` is still found, while a folder that already says what it is cannot be overruled by one part called `wall_mount.stl`. Set `"match_filenames": false` for path-only matching.
+
+To see what the rules are missing:
+
+```bash
+python update_catalog.py --unmatched 25
+```
+
+That lists the largest items no rule recognised, with the filenames inside them. It prints folder and file names only, never absolute paths, so it is safe to paste somewhere.
 
 Edit it, then apply it to what you already have:
 
@@ -175,7 +187,7 @@ The included `.gitignore` excludes all of it, plus `sources.txt` and `backups/`.
 - **No per-render timeout on Windows.** `SIGALRM` is Unix-only, so a corrupt or gigantic mesh can still stall a worker indefinitely there. `--max-mb` limits the blast radius. This is the next thing to fix.
 - `.step`/`.stp` files are catalogued but not thumbnailed — no CAD converter is bundled. They are reported as `unsupported` rather than left blank.
 - `.zip` archives are indexed by name only. Nothing is extracted.
-- Classification reads the **folder path and name**, not the filenames inside, so a kit in a folder called `KitA` full of `warhound_titan_*.stl` will not be labelled a titan. It is keyword-based and approximate either way; edit `rules.json` and run `--reclassify`.
+- Classification is keyword-based, so it is approximate. It reads the folder path first and the filenames inside as a fallback; it never opens a file to see what the model actually is. Edit `rules.json`, check with `--unmatched`, and apply with `--reclassify`.
 - `LIBRARY.bat` is Windows-only. Everything it does is available as a command elsewhere, and the Python script itself runs anywhere.
 
 ## License

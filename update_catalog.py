@@ -190,6 +190,7 @@ def _compiled():
     _CACHE["wargaming_cat"]=R.get("wargaming_category","Wargaming")
     _CACHE["default_cat"]=R.get("default_category","Uncategorised")
     _CACHE["generic"]={s.strip().lower() for s in R.get("generic_folder_names",[]) if isinstance(s,str)}
+    _CACHE["match_filenames"]=bool(R.get("match_filenames",True))
     return _CACHE
 
 def source_tag(path):
@@ -214,29 +215,54 @@ def source_tag(path):
     seg=[s for s in p.split("\\") if s]
     return seg[-2] if len(seg)>1 else (seg[0] if seg else "unknown")
 
-def classify(path, name):
+def _first(pairs, hay):
+    for label,rx in pairs:
+        if rx and rx.search(hay): return label
+    return None
+
+_FILENAME_CAP=4000
+def _filename_haystack(files):
+    """The part filenames as one lowercase string: stems only, de-duplicated, and
+    length-capped so a kit with three hundred parts does not turn every pattern
+    match into a scan of half a megabyte."""
+    if not files: return ""
+    seen=[]; total=0
+    for f in files:
+        stem=os.path.splitext(str(f))[0].lower().strip()
+        if not stem or stem in seen: continue
+        seen.append(stem); total+=len(stem)+1
+        if total>=_FILENAME_CAP: break
+    return " ".join(seen)
+
+def classify(path, name, files=None):
     """Return (category, faction, source, tags). Everything is keyword-driven; with an
-    empty rules.json every item simply lands in the default category with no faction."""
+    empty rules.json every item simply lands in the default category with no faction.
+
+    The folder path decides whenever it can. The names of the parts INSIDE are a
+    fallback, consulted only for what the path left blank — so a kit in a folder
+    called 'KitA' full of warhound_titan_*.stl is found, while a folder that already
+    says what it is cannot be overruled by one part called wall_mount.stl. Set
+    "match_filenames": false in rules.json to go back to path-only matching."""
     C=_compiled()
     s=(path+" "+name).lower()
+    inner=_filename_haystack(files) if C["match_filenames"] else ""
     src=source_tag(path)
-    faction=None
-    for fname,rx in C["factions"]:
-        if rx and rx.search(s): faction=fname; break
+    faction=_first(C["factions"], s)
+    if faction is None and inner: faction=_first(C["factions"], inner)
     war=C["wargaming"]
-    is_war = faction is not None or bool(war and war.search(s))
-    cat=None
+    is_war = faction is not None or bool(war and (war.search(s) or (inner and war.search(inner))))
     if is_war:
         cat=C["wargaming_cat"]
     else:
-        for cname,rx in C["categories"]:
-            if rx and rx.search(s): cat=cname; break
+        cat=_first(C["categories"], s)
+        if cat is None and inner: cat=_first(C["categories"], inner)
     if not cat: cat=C["default_cat"]
     tags=[]
     if faction: tags.append("faction:"+faction)
-    for tname,rx in C["types"]:
-        if rx and rx.search(s): tags.append("type:"+tname)
-    return cat, faction, src, tags
+    types=[t for t,rx in C["types"] if rx and rx.search(s)]
+    if not types and inner:
+        types=[t for t,rx in C["types"] if rx and rx.search(inner)]
+    return cat, faction, src, tags+["type:"+t for t in types]
 
 
 # ---------- rendering (host-native paths, no mount translation) ----------
@@ -378,7 +404,7 @@ def scan_folder(root):
                   "tags":tags+["format:"+ext.lstrip("."),"source:"+src,"packed:true"],"model_files":[]}
         if models:
             pid=stable_id(dp); name=os.path.basename(dp) or dp
-            cat,fac,src,tags=classify(dp,name)
+            cat,fac,src,tags=classify(dp,name,[m for m,_ in models])
             fmts=sorted(set(os.path.splitext(m)[1].lstrip(".") for m,_ in models))
             biggest=max(models,key=lambda x:x[1])[0]
             hinted=[i for i in images if PREVIEW_HINT.search(i[0])] or images
@@ -864,7 +890,7 @@ def reclassify(by_id, dry_run=False):
     Returns a list of (item, before, after) for everything that changed."""
     changed=[]
     for it in by_id.values():
-        cat,fac,src,tags=classify(it.get("path",""), it.get("name",""))
+        cat,fac,src,tags=classify(it.get("path",""), it.get("name",""), it.get("model_files"))
         newtags=(tags
                  +["format:"+f for f in (it.get("formats") or [])]
                  +["source:"+src,"packed:"+("true" if it.get("packed") else "false")])
@@ -874,6 +900,36 @@ def reclassify(by_id, dry_run=False):
         if not dry_run:
             it["category"]=cat; it["faction"]=fac; it["source"]=src; it["tags"]=newtags
     return changed
+
+def show_unmatched(by_id, n=25):
+    """What the rules did not recognise: entries sitting in the default category with
+    no faction, and the names of the parts inside them. This is the raw material for
+    writing better patterns. It prints folder and file NAMES only — never absolute
+    paths — so it can be pasted somewhere without handing over a map of the drive."""
+    default=_compiled()["default_cat"]
+    rows=[it for it in by_id.values()
+          if it.get("category")==default and not it.get("faction")]
+    print(f"\n{len(rows):,} of {len(by_id):,} entries matched no rule "
+          f"(category '{default}', no faction).")
+    if not rows:
+        print("Everything is classified. Nothing to tune."); return
+    rows.sort(key=lambda it: -(it.get("size_bytes") or 0))
+    print(f"the {min(n,len(rows))} largest:\n")
+    for it in rows[:n]:
+        dn,col,bc=_display_fields(it.get("path",""))
+        # don't echo the item's own name back at it as its location
+        col="" if (col=="(none)" or col.lower()==dn.lower()) else col
+        where=" › ".join(x for x in (col, bc) if x)
+        print(f"  {dn}")
+        if where: print(f"      in: {where}")
+        mfs=it.get("model_files") or []
+        if mfs:
+            print("      files: "+", ".join(mfs[:6])
+                  +(f"  (+{len(mfs)-6} more)" if len(mfs)>6 else ""))
+    if len(rows)>n:
+        print(f"\n  ...and {len(rows)-n:,} more. Show more with:  --unmatched {min(len(rows),200)}")
+    print("\nAdd patterns for what you see to rules.json (or rules.local.json), then:")
+    print("  python update_catalog.py --reclassify --dry-run")
 
 def print_reclassify_report(changed, total, examples=12):
     fields=("category","faction","source","labels")
@@ -1409,6 +1465,7 @@ def main():
     ap.add_argument("--dry-run",action="store_true",help="with --reclassify: show what would change and write nothing")
     ap.add_argument("--restore-backup",nargs="?",const="",default=None,metavar="FILE",help="put a backup from backups/ back in place as catalog.json (newest if no name given)")
     ap.add_argument("--backup",action="store_true",help="copy catalog.json into backups/ right now")
+    ap.add_argument("--unmatched",nargs="?",type=int,const=25,default=0,metavar="N",help="list entries no rule matched, with the part names inside them, to help write patterns")
     a=ap.parse_args()
     _ensure_dirs()
     jobs = a.jobs if a.jobs>0 else min(6, max(1,(os.cpu_count() or 2)-1))
@@ -1424,6 +1481,8 @@ def main():
         diagnose(list(by_id.values())); return
     if a.sources:
         show_sources(by_id); return
+    if a.unmatched:
+        show_unmatched(by_id, a.unmatched); return
     if a.add_source:
         p=a.add_source.strip().rstrip("\\/")
         if not os.path.isdir(p):
@@ -1515,6 +1574,7 @@ Or use these directly:
   --relocate --prune         also delete entries whose files are gone
   --reclassify               re-apply rules.json to everything already catalogued
   --reclassify --dry-run     ...show what that would change, and write nothing
+  --unmatched 25             what the rules missed, and the filenames inside
   --backup                   copy catalog.json into backups/ right now
   --restore-backup           put the newest backups/ copy back as catalog.json
   --sample 8                 preview 8 thumbnails into _render_test/
