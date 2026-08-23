@@ -1,0 +1,12 @@
+# Core — needed to render thumbnails from mesh files
+trimesh>=4.0
+numpy>=1.24
+pillow>=10.0
+matplotlib>=3.7
+
+# Recommended — much cleaner thumbnails for high-poly meshes
+fast-simplification>=0.1.7
+
+# Windows only — lets the tool try Windows' own thumbnail handler first.
+# Safe to omit; the tool falls back to its own renderer.
+pywin32>=306; sys_platform == "win32"

@@ -1,0 +1,40 @@
+# ---------------------------------------------------------------
+# YOUR LIBRARY DATA — never commit this. It contains absolute paths
+# to everything you own, and rendered images of models you licensed
+# for personal use.
+# ---------------------------------------------------------------
+catalog.json
+catalog.csv
+potential_duplicates.csv
+print-tracker-import.json
+sources.txt
+thumbnails/
+backups/
+_render_test/
+_engine_test/
+*.webp
+
+# gallery.html embeds the ENTIRE catalog inline as JSON - every path you own.
+# This is the single most important line in this file.
+gallery.html
+*.bak
+catalog*.json
+catalog*.csv
+
+# Local overrides of the classification rules
+rules.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# OS / editors
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/

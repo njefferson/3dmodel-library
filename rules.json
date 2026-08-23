@@ -1,0 +1,57 @@
+{
+  "_comment": "Classification rules. Edit freely - these are just keyword patterns (regular expressions, case-insensitive) matched against each item's folder path and name. Delete what you don't need; add your own.",
+
+  "generic_folder_names": [
+    "files", "file", "parts", "part", "stl", "stls", "stl files", "meshes", "mesh",
+    "obj", "objs", "output", "outputs", "export", "exports",
+    "supported", "presupported", "pre-supported", "pre supported",
+    "unsupported", "nosupports", "no supports", "supports", "support",
+    "3mf", "lys", "chitubox", "lychee", "print", "prints", "printing",
+    "to print", "for printing", "split", "cut", "assembled", "whole",
+    "bodies", "body", "misc", "new folder", "untitled", "resin", "fdm"
+  ],
+
+  "categories": {
+    "_comment": "Checked in order. First match wins. 'wargaming' is checked after the specific ones below it are ruled out.",
+    "Printer utilities": "calibrat|firmware|bed level|bed_level|filament guide|filament_guide|ender|prusa|geeetech|duet|klipper|octoprint|\\bmount\\b|cooling|fan duct|nozzle|z-?offset|test print|benchy|xyz cube|temp tower|retraction",
+    "Holiday / seasonal": "christmas|xmas|easter|halloween|valentine|thanksgiving|santa|snowflake|ornament|advent",
+    "Terrain & scenery": "terrain|scenery|building|ruin|ruins|bunker|\\bwall\\b|\\bwalls\\b|fortress|barricade|scatter|objective marker|sector|cityscape|habblock|hab block|industrial|scenic",
+    "Miniatures & busts": "\\bbust\\b|\\bbusts\\b",
+    "Games & accessories": "catan|dice tower|dice_tower|\\bdice\\b|token|counter|card holder|boardgame|board game|meeple|chess"
+  },
+
+  "wargaming_category": "Warhammer 40k / wargaming",
+  "wargaming_keywords": "40k|warhammer|\\bwh40k\\b|kill team|killteam|aos|age of sigmar|astra militarum|space marine|imperial|xenos|grey knight",
+  "default_category": "Misc / functional",
+
+  "factions": {
+    "_comment": "Set this to {} if you don't catalog wargaming models.",
+    "Tau": "\\btau\\b|t'au|kroot|riptide|crisis suit|broadside|hammerhead|devilfish|stealth suit|pathfinder",
+    "Tyranids": "tyranid|\\bnid\\b|carnifex|genestealer|hive tyrant|tyrant guard|gaunt|hormagaunt|termagant|zoanthrope|trygon|mawloc|lictor",
+    "Chaos": "chaos|khorne|nurgle|tzeentch|slaanesh|daemon|berzerker|plague marine|death guard|thousand sons|world eater|possessed|obliterator",
+    "Necrons": "necron|lychguard|immortal|deathmark|doomsday ark|monolith|canoptek|triarch|c'tan",
+    "Orks": "\\bork\\b|\\borks\\b|orruk|\\bnob\\b|boyz|deffkopta|killa kan|dread mob|\\bmek\\b|gretchin|squig",
+    "Aeldari": "aeldari|eldar|craftworld|drukhari|dark eldar|harlequin|wraithguard|wraithlord|howling banshee|dire avenger|wych|kabalite",
+    "Adeptus Custodes": "custodes|custodian|allarus|vertus|shield captain",
+    "Adepta Sororitas": "sororitas|sisters of battle|battle sister|repentia|seraphim|celestian",
+    "Adeptus Mechanicus": "mechanicus|admech|ad mech|skitarii|kastelan|dunecrawler|kataphron|ruststalker|tech-?priest",
+    "Astra Militarum": "astra militarum|imperial guard|\\bguard\\b|guardsmen|cadia|catachan|dkok|death korps|krieg|bullgryn|ogryn|leman russ|baneblade|basilisk|scion|tempestus",
+    "Grey Knights": "grey knight|greyknight|nemesis dreadknight|paladin justicar",
+    "Genestealer Cult": "genestealer cult|\\bgsc\\b|neophyte|acolyte hybrid|goliath truck",
+    "Knights & Titans": "titan|warhound|warlord|wardog|reaver|\\bknight\\b|questoris|armiger|dominus|cerastus|acastus",
+    "Space Marines / 30k": "space marine|spacemarine|primaris|astartes|\\b30k\\b|horus heresy|\\bheresy\\b|terminator|intercessor|dreadnought|land raider|rhino|predator|contemptor|legion|tactical marine"
+  },
+
+  "types": {
+    "_comment": "Extra cross-cutting labels shown as chips in the gallery.",
+    "terrain": "terrain|scenery|building|ruin|bunker|fortress|barricade",
+    "titan": "titan|warhound|warlord|wardog|reaver",
+    "bust": "\\bbust\\b|\\bbusts\\b",
+    "accessory": "token|counter|card holder|dice|meeple",
+    "printer-util": "calibrat|firmware|bed level|filament guide|benchy|temp tower"
+  },
+
+  "sources": {
+    "_comment": "OPTIONAL. Label items by where they came from. Key = label, value = pattern matched against the full path. Example: \"Patreon\": \"patreon|\\\\bpaid\\\\b\". Leave only this comment here to just use the top-level folder name instead."
+  }
+}

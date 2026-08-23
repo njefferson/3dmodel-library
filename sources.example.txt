@@ -1,0 +1,13 @@
+# Folders this library scans.
+#
+# Copy this file to  sources.txt  and put your own folders in it,
+# or just use LIBRARY.bat option 8 ("Add a folder"), which writes it for you.
+#
+# One folder per line. Lines starting with # are ignored.
+#
+# NOTE: don't put a whole cloud-sync root here (e.g. D:\Dropbox or
+# C:\Users\you\OneDrive). List the specific model folders you want indexed.
+# Scanning an entire cloud root can pull down gigabytes you didn't intend.
+
+D:\path\to\your\models
+E:\another\folder\of\stls
