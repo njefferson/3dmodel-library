@@ -27,12 +27,14 @@ echo   FOLDERS AND FILES
 echo     8   Add a folder to the library
 echo     9   Stop scanning a folder
 echo    10   Look for new files in all folders
-echo    11   Fix files I moved      (backs up first)
-echo    12   Remove entries for files that are gone  (backs up first)
+echo    11   Fix files I moved
+echo    12   Remove entries for files that are gone
+echo    13   Re-apply the keyword rules to everything
 echo.
 echo   OTHER
 echo     R   Refresh gallery + spreadsheet  (fast, no pictures)
 echo     B   Back up the catalog right now
+echo     U   Undo - put the newest backup back
 echo     H   Help - what these actually do
 echo     Q   Quit
 echo.
@@ -51,25 +53,49 @@ if "%c%"=="9"  goto srcdel
 if "%c%"=="10" goto rescanall
 if "%c%"=="11" goto relocate
 if "%c%"=="12" goto prune
+if "%c%"=="13" goto reclass
 if /i "%c%"=="R" goto refresh
 if /i "%c%"=="B" goto backup
+if /i "%c%"=="U" goto restore
 if /i "%c%"=="H" goto help
 if /i "%c%"=="Q" exit /b
 goto menu
 
 
-:backupquiet
-if not exist "backups" mkdir "backups"
-for /f "tokens=1-6 delims=/:. " %%a in ("%date% %time%") do set "ts=%%c%%a%%b_%%d%%e"
-set "ts=!ts: =0!"
-if exist "catalog.json" copy /y "catalog.json" "backups\catalog_!ts!.json" >nul 2>&1
-exit /b
-
 :backup
 cls & echo.
-call :backupquiet
-echo   Catalog backed up into the  backups  folder.
+python update_catalog.py --backup
+echo.
+echo   Backups kept (newest first):
 dir /b /o-d "backups\*.json" 2>nul | more +0
+goto pause
+
+:restore
+cls & echo.
+echo   Puts the newest backup back as the catalog. The file it replaces is
+echo   backed up first, so this can itself be undone.
+echo.
+set "y="
+set /p "y=  Type Y to continue: "
+if /i not "%y%"=="Y" goto menu
+cls & echo.
+python update_catalog.py --restore-backup
+python update_catalog.py --rebuild-views
+goto pause
+
+:reclass
+cls & echo.
+echo   Re-labels everything already in the catalog using rules.json as it
+echo   stands now. No folders are scanned and no pictures are re-made.
+echo   You get a preview first; nothing changes until you confirm.
+echo.
+python update_catalog.py --reclassify --dry-run
+echo.
+set "y="
+set /p "y=  Apply these changes? Type Y: "
+if /i not "%y%"=="Y" goto menu
+cls & echo.
+python update_catalog.py --reclassify
 goto pause
 
 :status
@@ -118,7 +144,6 @@ echo.
 set "f="
 set /p "f=  Folder: "
 if not defined f goto menu
-call :backupquiet
 cls & echo.
 python update_catalog.py "%f%" --engine mesh
 goto pause
@@ -145,7 +170,6 @@ echo.
 set "y="
 set /p "y=  Type Y to continue: "
 if /i not "%y%"=="Y" goto menu
-call :backupquiet
 cls & echo.
 python update_catalog.py --rescan-all --engine mesh
 goto pause
@@ -161,7 +185,6 @@ echo.
 set "y="
 set /p "y=  Type Y to continue: "
 if /i not "%y%"=="Y" goto menu
-call :backupquiet
 cls & echo.
 python update_catalog.py --relocate
 goto pause
@@ -172,10 +195,12 @@ echo   Removes catalog entries whose files no longer exist.
 echo   This does NOT touch your model files - only the catalog.
 echo   Run option 11 first so moved files aren't mistaken for gone.
 echo.
+echo   If a drive isn't plugged in, its entries are LEFT ALONE rather than
+echo   treated as deleted, so this is safe to run with something offline.
+echo.
 set "y="
 set /p "y=  Type Y to continue: "
 if /i not "%y%"=="Y" goto menu
-call :backupquiet
 cls & echo.
 python update_catalog.py --relocate --prune
 goto pause
@@ -207,12 +232,17 @@ echo   11 The catalog stores where files were. If you reorganise, this
 echo      matches moved folders by their contents and updates them,
 echo      keeping the same thumbnail so nothing is re-rendered.
 echo.
+echo   13 Changed rules.json? This re-labels everything already in the
+echo      catalog from the new rules - no rescan, nothing re-rendered.
+echo      It shows you what would change before it changes anything.
+echo.
 echo   NOTHING IN THIS MENU EVER MOVES, RENAMES OR DELETES YOUR
 echo   MODEL FILES. The library only reads them. Options 11 and 12
-echo   change the catalog only, and back it up first.
+echo   change the catalog only, and it is backed up first.
 echo.
-echo   Backups live in the  backups  folder. To undo, copy one over
-echo   catalog.json and choose R.
+echo   Backups happen automatically before anything that writes the
+echo   catalog, including the long picture runs. They live in the
+echo   backups  folder; option U puts the newest one back.
 echo.
 goto pause
 

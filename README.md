@@ -61,29 +61,47 @@ CHECK (safe)     3  status           4  scanned folders   5  test 6 thumbnails
 PICTURES         6  make missing     7  redo all
 FOLDERS/FILES    8  add folder       9  stop scanning    10  find new files
                 11  fix moved       12  remove dead entries
-OTHER            R  refresh          B  back up           H  help
+                13  re-apply rules
+OTHER            R  refresh          B  back up   U  undo   H  help
 ```
 
-Everything that can modify the catalog backs it up to `backups/` first.
+Anything that writes the catalog copies it into `backups/` first — including the
+long picture runs, which are the ones people interrupt. `U` puts the newest copy
+back.
 
 ## Commands
 
-| Command | What it does |
-|---|---|
-| `--add-source PATH` / `--remove-source PATH` / `--sources` | manage the folders that get scanned |
-| `"D:\some\folder"` | scan a folder and fold it into the library |
-| `--rescan-all` | rescan every listed folder, adding what's new |
-| `--thumbs-only` | make thumbnails only for items that lack one |
-| `--thumbs-only --force` | rebuild every thumbnail |
-| `--rebuild-views` | regenerate gallery + csv + json, no rendering |
-| `--relocate` | find items whose folder moved and update them in place |
-| `--relocate --prune` | also drop entries whose files are truly gone |
-| `--diagnose` | what's downloaded, what's cloud-only, is rendering working |
-| `--compare-engines 6` | render 6 small models with both engines, side by side |
-| `--sample 8` | preview 8 thumbnails into `_render_test/` |
-| `--jobs N` | render workers (default: about half your cores) |
-| `--max-mb N` | skip projects bigger than this (default 1500) |
-| `--engine shell\|mesh` | thumbnail engine (see below) |
+**Folders to scan**
+
+- `--sources` — list them, with a live OK/MISSING check and an item count each
+- `--add-source PATH` — add one
+- `--remove-source PATH` — stop scanning one (entries and files both stay)
+
+**Building the catalog**
+
+- `"D:\some\folder"` — scan a folder and fold it into the library
+- `--rescan-all` — rescan every listed folder, adding what's new
+- `--rebuild-views` — regenerate gallery, CSV and JSON from what's already known; no rendering
+- `--reclassify` — re-apply `rules.json` to everything already catalogued
+- `--reclassify --dry-run` — show exactly what that would change, and write nothing
+
+**Pictures**
+
+- `--thumbs-only` — make thumbnails only for items that lack one
+- `--thumbs-only --force` — rebuild every thumbnail
+- `--sample 8` — preview 8 thumbnails into `_render_test/`, changing nothing else
+- `--compare-engines 6` — render 6 small models with both engines, side by side
+- `--jobs N` — render workers (default: about half your cores)
+- `--max-mb N` — skip projects bigger than this (default 1500)
+- `--engine shell|mesh` — thumbnail engine (see below)
+
+**When things move or go wrong**
+
+- `--relocate` — find items whose folder moved and update them in place
+- `--relocate --prune` — also drop entries whose files are truly gone
+- `--diagnose` — what's downloaded, what's cloud-only, what failed and why
+- `--backup` — copy `catalog.json` into `backups/` right now
+- `--restore-backup` — put the newest backup back (the file it replaces is kept too)
 
 ---
 
@@ -95,11 +113,27 @@ Everything that can modify the catalog backs it up to `backups/` first.
 
 Use `--compare-engines 6` to see which one your machine actually produces better results with.
 
+## Why an item has no picture
+
+Every project carries a status saying what happened to its thumbnail, and it is
+in the CSV, in `--diagnose`, on the card in the gallery, and in the filter at the
+top of the page. Nothing is skipped silently.
+
+- **reused** — the artist shipped a preview image and it was used as-is
+- **shell** / **mesh** — rendered, by the Windows handler or the Python renderer
+- **existing** — a picture from an earlier run was already on disk
+- **cloud_only** — the files are still online-only placeholders; nothing was opened
+- **missing** — the files are not at the recorded path any more
+- **too_big** — over `--max-mb`, deliberately deferred
+- **unsupported** — `.step`/`.stp`, which nothing here can convert
+- **failed** — the renderer ran and produced nothing; the reason is recorded alongside it
+- **timeout** — the render was cut off. Unix only for now, since the timeout uses `SIGALRM`
+
 ## Cloud storage (Dropbox, OneDrive, Google Drive)
 
 Cataloging works on **metadata only** — filenames and sizes — so it never forces your cloud provider to download anything.
 
-Thumbnails are different: rendering needs the actual bytes. Files that are still online-only are detected via their Windows attributes, skipped without being touched, and reported by `--diagnose`. Mark the folders "available offline", let them sync, then run option 6 again to fill in the gaps. It's resumable — interrupt it whenever you like.
+Thumbnails are different: rendering needs the actual bytes. Files that are still online-only are detected via their Windows attributes, skipped without being touched, and reported by `--diagnose`. This is judged per file, not per project: a kit with eight parts downloaded and three still in the cloud renders from the eight, and the other three are not so much as named to the renderer. Mark the folders "available offline", let them sync, then run option 6 again to fill in the gaps. It's resumable — interrupt it whenever you like.
 
 ## When you reorganize
 
@@ -107,7 +141,26 @@ Items are identified by a fingerprint of their contents (the set of model filena
 
 ## Configuring the rules
 
-`rules.json` holds every keyword pattern used for categories, factions, types, and sources. It ships tuned for Warhammer 40k because that's what it was built against — set `"factions": {}` and rewrite `categories` if you catalog something else entirely. Patterns are ordinary case-insensitive regular expressions matched against each item's path.
+`rules.json` holds every keyword pattern used for categories, factions, types, and sources. It ships tuned for Warhammer 40k because that's what it was built against — set `"factions": {}` and rewrite `categories` if you catalog something else entirely. Patterns are ordinary case-insensitive regular expressions matched against each item's folder path and name.
+
+Edit it, then apply it to what you already have:
+
+```bash
+python update_catalog.py --reclassify --dry-run   # what would change
+python update_catalog.py --reclassify             # do it
+```
+
+That reads the catalog and rewrites the labels in it. No folder is walked, no model file is opened, no thumbnail is re-made. Put your own patterns in `rules.local.json` instead if you would rather not edit the shipped file — it wins where it exists, and it is gitignored.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Builds a catalog from a fixture of tiny STLs in a temp folder and checks the outputs are valid, that no project is ever skipped without a recorded reason, that an interrupted write cannot damage `catalog.json`, that online-only files are never handed to the renderer, and that relocate and prune do what they claim. No third-party packages and no Windows needed — the renderer is not exercised, only everything around it.
+
+Set `LIBRARY_DIR` to keep the catalog, thumbnails and backups somewhere other than next to the script; that is how the tests stay clear of a real library.
 
 ---
 
@@ -119,11 +172,11 @@ The included `.gitignore` excludes all of it, plus `sources.txt` and `backups/`.
 
 ## Known limitations
 
-- No per-render timeout on Windows (`SIGALRM` is Unix-only). A corrupt or gigantic mesh can stall a worker; `--max-mb` limits the blast radius.
-- `.step`/`.stp` files are catalogued but not thumbnailed — no CAD converter is bundled.
+- **No per-render timeout on Windows.** `SIGALRM` is Unix-only, so a corrupt or gigantic mesh can still stall a worker indefinitely there. `--max-mb` limits the blast radius. This is the next thing to fix.
+- `.step`/`.stp` files are catalogued but not thumbnailed — no CAD converter is bundled. They are reported as `unsupported` rather than left blank.
 - `.zip` archives are indexed by name only. Nothing is extracted.
-- Classification is keyword-based, so it is approximate. Fix it by editing `rules.json`.
-- `LIBRARY.bat` is Windows-only. Everything it does is available as a command elsewhere.
+- Classification reads the **folder path and name**, not the filenames inside, so a kit in a folder called `KitA` full of `warhound_titan_*.stl` will not be labelled a titan. It is keyword-based and approximate either way; edit `rules.json` and run `--reclassify`.
+- `LIBRARY.bat` is Windows-only. Everything it does is available as a command elsewhere, and the Python script itself runs anywhere.
 
 ## License
 

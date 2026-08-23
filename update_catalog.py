@@ -30,11 +30,21 @@ modified; this tool only ever reads them.
 REQUIREMENTS (one-time):
     pip install -r requirements.txt
 """
-import os, sys, json, csv, re, io, hashlib, signal, argparse
-LIB = os.path.dirname(os.path.abspath(__file__))
+import os, sys, json, csv, re, io, time, shutil, hashlib, signal, argparse, tempfile
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Where the catalog, thumbnails and backups live. Defaults to the script's own
+# folder, which is what everyone actually wants. LIBRARY_DIR lets the test suite -
+# and anyone keeping more than one library - point it elsewhere without copying
+# the script. Nothing is created at import time, so importing this module is safe.
+LIB = os.path.abspath(os.environ.get("LIBRARY_DIR") or SCRIPT_DIR)
 CATALOG = os.path.join(LIB, "catalog.json")
 CSVFILE = os.path.join(LIB, "catalog.csv")
-THUMBS  = os.path.join(LIB, "thumbnails"); os.makedirs(THUMBS, exist_ok=True)
+THUMBS  = os.path.join(LIB, "thumbnails")
+BACKUPS = os.path.join(LIB, "backups")
+
+def _ensure_dirs():
+    os.makedirs(THUMBS, exist_ok=True)
 
 MODEL={".stl",".obj",".3mf",".step",".stp",".ply"}
 SLICER={".gcode",".ctb",".lys",".lychee",".cbddlp",".photon",".pwmx",".pwms",".fdg",".goo",".chitubox",".zcode"}
@@ -43,9 +53,105 @@ ARCH={".zip",".rar",".7z"}
 
 def stable_id(p): return hashlib.sha1(p.strip().lower().replace("/","\\").encode("utf-8","ignore")).hexdigest()[:16]
 
+# ---------- writing the catalog: never leave a half-written file behind ----------
+def atomic_write(path, text, encoding="utf-8"):
+    """Write to a temp file in the same folder, then os.replace() it into position.
+    os.replace is atomic on Windows and POSIX alike, so a Ctrl+C or a crash midway
+    leaves the PREVIOUS file intact instead of a truncated one. The old code wrote
+    straight over catalog.json, and an interrupt during a mid-render checkpoint left
+    a corrupt file that every later command died on."""
+    d=os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(d, exist_ok=True)
+    fd,tmp=tempfile.mkstemp(dir=d, prefix=".tmp-", suffix="-"+os.path.basename(path))
+    os.close(fd)
+    try:
+        with open(tmp,"w",encoding=encoding,newline="") as fp:
+            fp.write(text); fp.flush(); os.fsync(fp.fileno())
+        os.replace(tmp,path)
+        tmp=None
+    finally:
+        if tmp and os.path.exists(tmp):
+            try: os.remove(tmp)
+            except OSError: pass
+
+_BACKED_UP=False
+def backup_catalog(keep=10, force=False):
+    """Copy catalog.json into backups/ once per run, before the first write.
+    The menu only backed up on some options - never on the long thumbnail runs,
+    which are the ones people interrupt. Returns the backup path, or None."""
+    global _BACKED_UP
+    if (_BACKED_UP and not force) or not os.path.exists(CATALOG): return None
+    _BACKED_UP=True
+    try:
+        os.makedirs(BACKUPS, exist_ok=True)
+        dst=os.path.join(BACKUPS,"catalog_"+time.strftime("%Y%m%d_%H%M%S")+".json")
+        if os.path.exists(dst): dst=dst[:-5]+"_%d.json"%os.getpid()
+        shutil.copy2(CATALOG,dst)
+        old=sorted(f for f in os.listdir(BACKUPS) if f.startswith("catalog_") and f.endswith(".json"))
+        for f in old[:-keep]:
+            try: os.remove(os.path.join(BACKUPS,f))
+            except OSError: pass
+        return dst
+    except OSError as e:
+        print(f"  [warning] could not back up the catalog ({e}); continuing.")
+        return None
+
+def list_backups():
+    if not os.path.isdir(BACKUPS): return []
+    return sorted((os.path.join(BACKUPS,f) for f in os.listdir(BACKUPS)
+                   if f.startswith("catalog_") and f.endswith(".json")))
+
+def restore_backup(which=None):
+    """Put a backup back in place as catalog.json. The file being replaced is itself
+    backed up first, so this is reversible. The menu's advice used to be 'copy one
+    over catalog.json' by hand, which is not much help on the day it is needed."""
+    b=list_backups()
+    if not b:
+        print(f"No backups found in {BACKUPS}."); return False
+    if which:
+        src=which if os.path.isabs(which) else os.path.join(BACKUPS,which)
+        if not os.path.exists(src):
+            print(f"Not found: {src}\nAvailable:")
+            for f in b[-10:]: print("   ",os.path.basename(f))
+            return False
+    else:
+        src=b[-1]
+    if os.path.exists(CATALOG):
+        keep=backup_catalog(force=True)
+        if keep: print(f"kept the current catalog.json as {os.path.basename(keep)}")
+    with open(src,encoding="utf-8") as fp: atomic_write(CATALOG, fp.read())
+    print(f"restored {os.path.basename(src)} -> catalog.json")
+    print("now refresh the views:  python update_catalog.py --rebuild-views")
+    return True
+
+def load_catalog():
+    """Read catalog.json into {id: item}. A truncated or corrupt file is reported
+    with the backups available to restore from, instead of a traceback."""
+    if not os.path.exists(CATALOG): return {}
+    try:
+        with open(CATALOG,encoding="utf-8") as fp: data=json.load(fp)
+        items=data["items"]
+        if not isinstance(items,list): raise ValueError("'items' is not a list")
+    except (ValueError,KeyError,OSError,UnicodeDecodeError) as e:
+        print(f"\ncatalog.json could not be read: {e}")
+        print("That usually means a previous run was interrupted while writing it.")
+        b=list_backups()
+        if b:
+            print(f"\n{len(b)} backup(s) are available. Restore the newest with:")
+            print("   python update_catalog.py --restore-backup")
+            print(f"\nnewest: {os.path.basename(b[-1])}")
+        else:
+            print("\nNo backups were found. Rebuild from your folders with:")
+            print("   python update_catalog.py --rescan-all")
+        sys.exit(2)
+    return {it["id"]:it for it in items if isinstance(it,dict) and it.get("id")}
+
 # ---------- classification: all keyword rules come from rules.json ----------
 RULES_FILE=os.path.join(LIB,"rules.json")
 LOCAL_RULES=os.path.join(LIB,"rules.local.json")
+# When LIBRARY_DIR points somewhere else, the shipped rules still come from the
+# script's own folder unless that library has its own copy.
+_RULE_FILES=[LOCAL_RULES, RULES_FILE, os.path.join(SCRIPT_DIR,"rules.json")]
 _RULES=None
 def rules():
     """Load rules.local.json if present, else rules.json. Missing/broken -> {} so
@@ -53,7 +159,7 @@ def rules():
     global _RULES
     if _RULES is None:
         _RULES={}
-        for p in (LOCAL_RULES, RULES_FILE):
+        for p in _RULE_FILES:
             if os.path.exists(p):
                 try:
                     with open(p,encoding="utf-8") as fp: _RULES=json.load(fp)
@@ -102,7 +208,9 @@ def source_tag(path):
     if best:
         # The scanned folder's own name. (The first subfolder under it is already
         # surfaced separately as "collection", so repeating it here just adds noise.)
-        return os.path.basename(best) or best
+        # Split on the separator we normalised to, not the platform's: os.path.basename
+        # does not recognise a backslash off Windows.
+        return best.split("\\")[-1] or best
     seg=[s for s in p.split("\\") if s]
     return seg[-2] if len(seg)>1 else (seg[0] if seg else "unknown")
 
@@ -142,13 +250,20 @@ def _alarm(n):
     if _HAS_ALARM:
         signal.alarm(n)
 def _render(model_paths, out_path, timeout=25):
+    """Render one thumbnail from a list of mesh files.
+    Returns (True, None) or (False, reason). The reason used to be discarded, which
+    is why a project that never got a picture gave no clue why - a missing library,
+    a corrupt mesh and an out-of-memory kill all looked identical from outside."""
     try:
-        import numpy as np, matplotlib; matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-        from PIL import Image; import trimesh
+        try:
+            import numpy as np, matplotlib; matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+            from PIL import Image; import trimesh
+        except ImportError as e:
+            return (False, "render library missing: "+(getattr(e,"name",None) or str(e)))
         _alarm(timeout)
-        meshes=[]
+        meshes=[]; load_err=None
         for mp in model_paths:
             try:
                 m=trimesh.load(mp, force="mesh")
@@ -160,8 +275,12 @@ def _render(model_paths, out_path, timeout=25):
                         v=a[:,12:48].copy().view("<f4").reshape(-1,3)
                         m=trimesh.Trimesh(vertices=v,faces=np.arange(nt*3).reshape(nt,3),process=False)
                 if hasattr(m,"faces") and len(m.faces)>0: meshes.append(m)
-            except Exception: continue
-        if not meshes: _alarm(0); return None
+            except Exception as e:
+                if load_err is None: load_err=f"{os.path.basename(mp)}: {type(e).__name__}: {e}"[:160]
+                continue
+        if not meshes:
+            _alarm(0)
+            return (False, load_err or f"no loadable geometry in {len(model_paths)} file(s)")
         mesh=trimesh.util.concatenate(meshes) if len(meshes)>1 else meshes[0]
         v=np.asarray(mesh.vertices,dtype=float); f=np.asarray(mesh.faces)
         CAP=16000
@@ -209,18 +328,23 @@ def _render(model_paths, out_path, timeout=25):
         ax.view_init(26,-58); ax.set_axis_off()
         fig.patch.set_facecolor("#20242c"); ax.set_facecolor("#20242c"); fig.subplots_adjust(0,0,1,1)
         buf=io.BytesIO(); fig.savefig(buf,format="png",facecolor="#20242c"); plt.close(fig); buf.seek(0)
-        _save_webp(Image.open(buf), out_path); _alarm(0); return True
+        _save_webp(Image.open(buf), out_path); _alarm(0); return (True,None)
     except TO:
-        _alarm(0); return None
-    except Exception:
-        _alarm(0); return None
+        _alarm(0); return (False,"timeout")
+    except MemoryError:
+        _alarm(0); return (False,"out of memory (mesh too large to render)")
+    except Exception as e:
+        _alarm(0); return (False,f"{type(e).__name__}: {e}"[:160])
 
 def _reuse(img_path, out_path, timeout=20):
+    """Reuse the artist's shipped preview image. Returns (True, None) or (False, reason)."""
     try:
         from PIL import Image; _alarm(timeout)
-        im=Image.open(img_path); im.load(); _save_webp(im,out_path); _alarm(0); return True
-    except Exception:
-        _alarm(0); return None
+        im=Image.open(img_path); im.load(); _save_webp(im,out_path); _alarm(0); return (True,None)
+    except TO:
+        _alarm(0); return (False,"timeout")
+    except Exception as e:
+        _alarm(0); return (False,f"{type(e).__name__}: {e}"[:160])
 
 def _save_webp(im, out_path, edge=512, ceiling=200000):
     from PIL import Image
@@ -256,22 +380,40 @@ def scan_folder(root):
             pid=stable_id(dp); name=os.path.basename(dp) or dp
             cat,fac,src,tags=classify(dp,name)
             fmts=sorted(set(os.path.splitext(m)[1].lstrip(".") for m,_ in models))
+            biggest=max(models,key=lambda x:x[1])[0]
             hinted=[i for i in images if PREVIEW_HINT.search(i[0])] or images
             prev=max(hinted,key=lambda x:x[1])[0] if images else None
             projects[pid]={"id":pid,"type":"project","name":name,"path":dp,"source":src,
               "category":cat,"faction":fac,"packed":False,"part_count":len(models),"formats":fmts,
               "size_bytes":sum(s for _,s in models),"thumbnail":None,"thumb_status":"pending",
+              "primary_file":biggest,
               "has_shipped_preview":prev is not None,"preview_file":os.path.join(dp,prev) if prev else None,
               "tags":tags+["format:"+f for f in fmts]+["source:"+src,"packed:false"],
               "model_files":[m for m,_ in models]}
     return projects, archives
 
+def _hydrated_parts(it):
+    """(hydrated paths, cloud-only count, not-found count) for one project.
+    Attribute reads only — asking about an online-only file never pulls it down.
+    This replaces a check that only ever looked at model_files[0]: a kit whose
+    first part was in the cloud was written off entirely, and one whose first part
+    was local had its REMAINING parts handed to the renderer, which opened them
+    and so forced exactly the download the whole design is meant to avoid."""
+    hyd=[]; cloud=0; gone=0
+    base=it.get("path","")
+    for f in (it.get("model_files") or []):
+        st=_hydrated(os.path.join(base,f))
+        if st is True: hyd.append(os.path.join(base,f))
+        elif st is False: cloud+=1
+        else: gone+=1
+    return hyd,cloud,gone
+
 def _renderable_now(it):
     """(prev_ok, model_ok) using attribute reads only — never triggers a download."""
-    mfs=it.get("model_files") or []; prev=it.get("preview_file")
+    prev=it.get("preview_file")
     prev_ok=bool(it.get("has_shipped_preview") and prev and _hydrated(prev) is True)
-    model_ok=bool(mfs and _hydrated(os.path.join(it["path"],mfs[0])) is True)
-    return prev_ok, model_ok
+    hyd,_c,_g=_hydrated_parts(it)
+    return prev_ok, bool(hyd)
 
 # ---------- fast path: the Windows shell thumbnail handler (what Explorer uses) ----------
 def _hbitmap_to_pil(hbitmap):
@@ -351,23 +493,48 @@ def _shell_thumb(src_path, out_path, size=512, bg=(32,36,44)):
     except Exception:
         return False
 
+# Catalogued, but nothing bundled here can turn CAD into a picture.
+UNRENDERABLE={".step",".stp"}
+# Every value thumb_status can hold. OK_STATUS means a picture exists.
+OK_STATUS={"reused","shell","mesh","existing"}
+STATUS_LABEL={
+ "reused":"used the artist's own preview image","shell":"rendered by the Windows handler",
+ "mesh":"rendered from the mesh","existing":"already on disk from an earlier run",
+ "packed":"packed .zip — nothing extracted",
+ "pending":"not attempted yet","cloud_only":"online-only, not downloaded yet",
+ "missing":"files not found at the recorded path","too_big":"skipped — over the --max-mb limit",
+ "no_model_file":"no model file recorded","unsupported":"CAD (.step/.stp) — no converter bundled",
+ "timeout":"the renderer timed out","failed":"the renderer ran and produced nothing"}
+
 def _thumb_for(it, out_path, engine="shell"):
-    """Produce one thumbnail: reuse shipped preview, else shell handler, else mesh render."""
-    prev_ok,model_ok=_renderable_now(it)
-    if prev_ok and _reuse(it["preview_file"], out_path): return "reused"
-    if not model_ok: return "pending"
-    mfs=it.get("model_files") or []
+    """Produce one thumbnail: reuse shipped preview, else shell handler, else mesh render.
+    Returns (status, detail). Every outcome names itself — the old version returned
+    the bare string "pending" for a file still in the cloud, a missing render
+    library, a corrupt mesh and an out-of-memory kill alike."""
+    prev=it.get("preview_file")
+    if it.get("has_shipped_preview") and prev and _hydrated(prev) is True:
+        ok,_why=_reuse(prev, out_path)
+        if ok: return ("reused",None)      # a bad preview file just falls through to the mesh
+    if not (it.get("model_files") or []): return ("no_model_file",None)
+    hyd,cloud,gone=_hydrated_parts(it)
+    if not hyd:
+        if cloud: return ("cloud_only", f"{cloud} part(s) still online-only")
+        return ("missing", f"{gone} file(s) not found under {it.get('path','')}")
+    renderable=[p for p in hyd if os.path.splitext(p)[1].lower() not in UNRENDERABLE]
+    if not renderable:
+        return ("unsupported", "only "+", ".join(sorted({os.path.splitext(p)[1].lower() for p in hyd})))
     best=None; bestsz=-1
-    for f in mfs:                      # largest hydrated part = most representative
-        p=os.path.join(it["path"],f)
-        if _hydrated(p) is not True: continue
+    for p in renderable:               # largest hydrated part = most representative
         try: sz=os.path.getsize(p)
         except OSError: continue
         if sz>bestsz: bestsz=sz; best=p
-    if engine!="mesh" and best and _shell_thumb(best, out_path): return "shell"
-    mps=[os.path.join(it["path"],f) for f in mfs]
-    if _render(mps, out_path): return "mesh"
-    return "pending"
+    if engine!="mesh" and best and _shell_thumb(best, out_path): return ("shell",None)
+    ok,why=_render(renderable, out_path)
+    if ok:
+        # rendered, but say so if it is only part of the kit
+        return ("mesh", f"rendered from {len(renderable)} of {len(renderable)+cloud+gone} part(s)"
+                        if (cloud or gone) else None)
+    return ("timeout" if why=="timeout" else "failed", why)
 
 _ENGINE="shell"
 def _init_worker(engine):
@@ -376,79 +543,150 @@ def _init_worker(engine):
 def render_one(it):
     """Pool worker. Uses the module-global engine (set via pool initializer). Never raises."""
     try:
-        return (it["id"], _thumb_for(it, os.path.join(THUMBS, it["id"]+".webp"), _ENGINE))
-    except Exception:
-        return (it["id"],"pending")
+        st,detail=_thumb_for(it, os.path.join(THUMBS, it["id"]+".webp"), _ENGINE)
+        return (it["id"], st, detail)
+    except Exception as e:
+        return (it["id"], "failed", f"{type(e).__name__}: {e}"[:160])
+
+def _skip_status(it):
+    """Why this project cannot be rendered right now, or (None, None) if it can.
+    Attribute reads only — nothing is opened, so nothing is pulled out of the cloud."""
+    if not (it.get("model_files") or []): return ("no_model_file",None)
+    hyd,cloud,gone=_hydrated_parts(it)
+    if hyd: return (None,None)
+    if cloud: return ("cloud_only", f"{cloud} part(s) still online-only")
+    return ("missing", f"{gone} file(s) not found under {it.get('path','')}")
+
+def _mesh_libs_missing():
+    """The first render library that will not import, or None."""
+    for mod in ("numpy","trimesh","matplotlib","PIL"):
+        try: __import__(mod)
+        except Exception: return mod
+    return None
+
+def status_counts(items):
+    from collections import Counter
+    return Counter((it.get("thumb_status") or "pending")
+                   for it in items if it.get("type")=="project")
+
+def print_status_summary(items, prefix="  ", examples=3):
+    """What happened to every project, and for anything without a picture, why.
+    Before this, a project that failed to render was indistinguishable from one
+    nobody had got to yet: both said 'pending' and neither said anything at all."""
+    c=status_counts(items); ex={}
+    for it in items:
+        if it.get("type")!="project": continue
+        st=it.get("thumb_status") or "pending"
+        if st in OK_STATUS or st=="packed": continue
+        ex.setdefault(st,[])
+        if len(ex[st])<examples: ex[st].append((it.get("path",""), it.get("thumb_error") or ""))
+    order=[k for k in ("reused","shell","mesh","existing") if c.get(k)]+ \
+          [k for k in sorted(c) if k not in OK_STATUS]
+    print(f"\n{prefix}Thumbnails, by outcome:")
+    for st in order:
+        print(f"{prefix}  {c[st]:>6,}  {st:<14} {STATUS_LABEL.get(st,'')}")
+    for st in order:
+        if st in OK_STATUS or not ex.get(st): continue
+        print(f"\n{prefix}{st} — examples:")
+        for path,why in ex[st]:
+            print(f"{prefix}  {path}")
+            if why: print(f"{prefix}    {why}")
 
 def render_missing(items, checkpoint=None, force=False, jobs=1, engine="shell", max_mb=1500):
-    import time
+    _ensure_dirs()
     global _ENGINE; _ENGINE=engine   # used by the serial path (render_one reads it)
     idmap={it["id"]:it for it in items if it.get("type")=="project"}
     targets=[]; pending_total=0
     for it in items:
         if it.get("type")!="project": continue
         if not force and os.path.exists(os.path.join(THUMBS,it["id"]+".webp")):
-            it["thumbnail"]=it["id"]+".webp"; continue
+            it["thumbnail"]=it["id"]+".webp"
+            if it.get("thumb_status") not in OK_STATUS: it["thumb_status"]="existing"
+            it.pop("thumb_error",None)
+            continue
         pending_total+=1
-        po,mo=_renderable_now(it)
-        if po or mo: targets.append(it)
-        else: it["thumb_status"]="pending"
+        st,why=_skip_status(it)
+        if st is None: targets.append(it)
+        else:
+            it["thumb_status"]=st
+            if why: it["thumb_error"]=why
+            else: it.pop("thumb_error",None)
     # Smallest first: the gallery fills up fast and you can look at real results
     # long before the giant outliers are reached.
     targets.sort(key=lambda it: it.get("size_bytes",0))
     deferred=[it for it in targets if it.get("size_bytes",0)>max_mb*1e6]
     targets=[it for it in targets if it.get("size_bytes",0)<=max_mb*1e6]
+    for it in deferred:
+        it["thumb_status"]="too_big"
+        it["thumb_error"]=f"{it.get('size_bytes',0)/1e6:.0f} MB, over the {max_mb:.0f} MB limit"
     total=len(targets); cloud=pending_total-total-len(deferred)
     jobs=max(1,int(jobs))
+    missing_lib=_mesh_libs_missing()
+    if missing_lib:
+        # The old code rendered nothing and printed "0 ok" without ever saying why.
+        print(f"\n  [!] {missing_lib} is not installed, so the mesh renderer cannot run.")
+        print( "      Every render will fail until you run:  pip install -r requirements.txt\n", flush=True)
     if deferred:
         print(f"  deferring {len(deferred)} huge project(s) over {max_mb:.0f} MB "
               f"(run with --max-mb 99999 to include them).", flush=True)
     print(f"  {pending_total} projects need a thumbnail; {total} downloaded & renderable now, "
-          f"{cloud} still in the cloud{' (FORCE re-render)' if force else ''}.", flush=True)
+          f"{cloud} not renderable yet{' (FORCE re-render)' if force else ''}.", flush=True)
     print(f"  Rendering with {jobs} core(s), engine='{engine}'. Safe to press Ctrl+C anytime —", flush=True)
     print("  finished thumbnails are kept and re-running resumes where it stopped.\n", flush=True)
-    done=0; t0=time.time()
+    done=0; failed=0; t0=time.time(); seen=set()
     def report(k):
         el=time.time()-t0; rate=el/max(k,1); left=(total-k)*rate
-        print(f"  {k}/{total} done ({done} ok)  {el:.0f}s elapsed  ~{int(left//60)}m{int(left%60):02d}s left", flush=True)
-    def apply(pid,status):
-        nonlocal done
+        print(f"  {k}/{total} done ({done} ok, {failed} failed)  {el:.0f}s elapsed  "
+              f"~{int(left//60)}m{int(left%60):02d}s left", flush=True)
+    def apply(pid,status,detail=None):
+        nonlocal done,failed
         it=idmap.get(pid)
         if it is None: return
+        seen.add(pid)
         it["thumb_status"]=status
-        if status in ("reused","shell","mesh","rendered"): it["thumbnail"]=pid+".webp"; done+=1
+        if detail: it["thumb_error"]=detail
+        else: it.pop("thumb_error",None)
+        if status in OK_STATUS: it["thumbnail"]=pid+".webp"; done+=1
+        else: failed+=1
     if jobs>1 and total:
         try:
             import multiprocessing as mp
             with mp.Pool(jobs, initializer=_init_worker, initargs=(engine,)) as pool:
-                for k,(pid,status) in enumerate(pool.imap_unordered(render_one, targets, chunksize=1),1):
-                    apply(pid,status)
+                for k,(pid,status,detail) in enumerate(pool.imap_unordered(render_one, targets, chunksize=1),1):
+                    apply(pid,status,detail)
                     if k%5==0 or k==total: report(k)
                     if checkpoint and (k%150==0 or k==50):
                         checkpoint()
                         print("   [gallery.html refreshed — you can open it now]", flush=True)
-            print(f"\n  finished: {done}/{total} rendered in {time.time()-t0:.0f}s "
-                  f"({cloud} still not downloaded)", flush=True)
-            return done
         except Exception as e:
             print(f"  [multi-core unavailable ({type(e).__name__}: {e}); continuing on a single core]\n", flush=True)
-    for k,it in enumerate(targets,1):
-        pid,status=render_one(it); apply(pid,status)
-        if k%5==0 or k==total: report(k)
+    left=[it for it in targets if it["id"] not in seen]
+    for k,it in enumerate(left,1):
+        pid,status,detail=render_one(it); apply(pid,status,detail)
+        if k%5==0 or k==len(left): report(len(seen))
         if checkpoint and done and done%100==0: checkpoint()
-    print(f"\n  finished: {done}/{total} rendered in {time.time()-t0:.0f}s "
-          f"({cloud} still not downloaded)", flush=True)
+    print(f"\n  finished: {done}/{total} rendered in {time.time()-t0:.0f}s"
+          f"{f', {failed} could not be rendered' if failed else ''}", flush=True)
+    print_status_summary(items)
     return done
 
 SOURCES=os.path.join(LIB,"sources.txt")
 
+_SOURCES_CACHE=None
 def load_sources():
-    if not os.path.exists(SOURCES): return []
+    """Cached: _display_fields() and source_tag() ask for this once PER ITEM, and
+    write_catalog/write_gallery/write_import each walk every item."""
+    global _SOURCES_CACHE
+    if _SOURCES_CACHE is not None: return list(_SOURCES_CACHE)
+    if not os.path.exists(SOURCES):
+        _SOURCES_CACHE=[]; return []
     out=[]
-    for line in open(SOURCES,encoding="utf-8"):
-        s=line.strip()
-        if s and not s.startswith("#"): out.append(s.rstrip("\\/"))
-    return out
+    with open(SOURCES,encoding="utf-8") as fp:
+        for line in fp:
+            s=line.strip()
+            if s and not s.startswith("#"): out.append(s.rstrip("\\/"))
+    _SOURCES_CACHE=out
+    return list(out)
 
 def save_sources(paths, header=True):
     seen=[];
@@ -463,6 +701,7 @@ def save_sources(paths, header=True):
                      "# NOTE: never put a whole cloud root here (e.g. D:\\Dropbox) - list the\n"
                      "# specific subfolders you actually want indexed.\n\n")
         for p in seen: fp.write(p+"\n")
+    global _SOURCES_CACHE; _SOURCES_CACHE=list(seen)
     return seen
 
 def show_sources(by_id=None):
@@ -500,48 +739,164 @@ def _fingerprint(it):
     sig="|".join(names)+f"::{len(names)}::{int(it.get('size_bytes') or 0)}"
     return hashlib.md5(sig.encode("utf-8","ignore")).hexdigest()[:16]
 
-def _primary_file(it):
-    """The filename to paste into Windows search when hunting for this item."""
+def primary_file(it):
+    """The filename to paste into Windows search when hunting for this item: the
+    largest part, recorded during the scan from sizes we already had. Entries from
+    a catalog written before that field existed fall back to the first part."""
     mfs=it.get("model_files") or []
-    if not mfs: return os.path.basename(it.get("path",""))
-    best=None;bestsz=-1
-    for f in mfs:                       # prefer the largest part if we can see sizes
-        try: sz=os.path.getsize(os.path.join(it["path"],f))
-        except OSError: sz=-1
-        if sz>bestsz: bestsz=sz; best=f
-    return best or mfs[0]
+    return it.get("primary_file") or (mfs[0] if mfs else os.path.basename(it.get("path","")))
+
+def _norm(p):
+    """Path in the same shape stable_id() sees it, for comparing two entries."""
+    return str(p or "").strip().lower().replace("/","\\").rstrip("\\")
+
+def _source_root_for(path):
+    """The scanned folder from sources.txt that contains this path, or None."""
+    p=_norm(path); best=None
+    for root in load_sources():
+        r=_norm(root)
+        if p==r or p.startswith(r+"\\"):
+            if best is None or len(r)>len(_norm(best)): best=root
+    return best
+
+def _root_unavailable(path):
+    """True when the folder this entry lives under is not reachable AT ALL — an
+    unplugged drive, a network share that is down, a cloud folder that has not
+    mounted yet. That is not the same as the files having been deleted, and it is
+    the case where pruning destroys a perfectly good catalog: running
+    --relocate --prune with the models drive disconnected used to empty it."""
+    root=_source_root_for(path)
+    if root is not None: return not os.path.isdir(root)
+    anchor=os.path.splitdrive(str(path))[0]
+    if anchor: return not os.path.isdir(anchor+os.sep)
+    return False
+
+def _move_thumb(old_id, new_id):
+    src=os.path.join(THUMBS,old_id+".webp"); dst=os.path.join(THUMBS,new_id+".webp")
+    if old_id==new_id or not os.path.exists(src): return False
+    try:
+        os.replace(src,dst); return True
+    except OSError:
+        return False
+
+def _rekey(by_id, it, new_path):
+    """Move an entry to the id its new path implies, carrying its thumbnail file.
+    Ids are sha1(path). The old relocate kept the ORIGINAL id after adopting a new
+    path, so the entry and its location disagreed for good: the next scan of that
+    folder minted a second entry under the path-derived id, both folders existed,
+    and no later relocate could ever merge them. Four commands produced a permanent
+    duplicate — one card with the picture, one without."""
+    old_id=it["id"]; new_id=stable_id(new_path)
+    it["path"]=new_path
+    if new_id==old_id: return old_id
+    _move_thumb(old_id,new_id)
+    it["id"]=new_id
+    if it.get("thumbnail"): it["thumbnail"]=new_id+".webp"
+    by_id.pop(old_id,None); by_id[new_id]=it
+    return new_id
+
+def _dedupe_paths(by_id):
+    """Collapse entries that point at the same folder. Heals catalogs that already
+    carry duplicates from the old relocate. Keeps the entry whose id matches its
+    path, and carries the other one's thumbnail across rather than re-rendering."""
+    seen={}; dropped=0
+    for it in sorted((i for i in by_id.values() if i.get("type")=="project"),
+                     key=lambda i: i.get("id","")):
+        k=_norm(it.get("path",""))
+        if not k: continue
+        other=seen.get(k)
+        if other is None: seen[k]=it; continue
+        canon=stable_id(it.get("path",""))
+        if it["id"]==canon and other["id"]!=canon: keep,drop=it,other
+        elif other["id"]==canon and it["id"]!=canon: keep,drop=other,it
+        elif other.get("thumbnail") and not it.get("thumbnail"): keep,drop=other,it
+        else: keep,drop=it,other
+        if not keep.get("thumbnail") and drop.get("thumbnail"):
+            if _move_thumb(drop["id"],keep["id"]) or os.path.exists(os.path.join(THUMBS,keep["id"]+".webp")):
+                keep["thumbnail"]=keep["id"]+".webp"
+                keep["thumb_status"]=drop.get("thumb_status") or "existing"
+        by_id.pop(drop["id"],None); seen[k]=keep; dropped+=1
+    return dropped
 
 def relocate_and_prune(by_id, prune=False):
     """Detect entries whose folder moved: match a missing old path to a present new
-    path by fingerprint, then update in place (same id, same thumbnail, same tags)."""
+    path by fingerprint, then update in place (same thumbnail, same tags).
+    Returns (moved, dropped, deduped, kept_unreachable)."""
     missing=[]; present={}
-    for it in by_id.values():
+    for it in list(by_id.values()):
         if it.get("type")!="project": continue
         fp=_fingerprint(it)
         if not fp: continue
         if os.path.isdir(it.get("path","")): present.setdefault(fp,[]).append(it)
         else: missing.append((fp,it))
-    moved=0; dropped=0; merged=[]
+    moved=0; dropped=0
     for fp,old in missing:
-        cands=[c for c in present.get(fp,[]) if c is not old]
-        if len(cands)==1:
-            new=cands[0]
-            # keep the ORIGINAL id/thumbnail; adopt the new location
-            old["path"]=new["path"]
-            old["model_files"]=new.get("model_files",old.get("model_files"))
-            old["preview_file"]=new.get("preview_file")
-            old["thumb_status"]=old.get("thumb_status","pending")
-            merged.append(new["id"]); moved+=1
-    for mid in merged:                      # remove the duplicate new-id record
-        by_id.pop(mid,None)
+        cands=[c for c in present.get(fp,[]) if c is not old and c.get("id") in by_id]
+        if len(cands)!=1: continue
+        new=cands[0]; newpath=new["path"]
+        # keep the ORIGINAL entry's history; adopt the new location and its id
+        old["model_files"]=new.get("model_files",old.get("model_files"))
+        old["preview_file"]=new.get("preview_file")
+        if new.get("primary_file"): old["primary_file"]=new["primary_file"]
+        old["thumb_status"]=old.get("thumb_status","pending")
+        by_id.pop(new["id"],None)
+        _rekey(by_id, old, newpath)
+        moved+=1
+    deduped=_dedupe_paths(by_id)
+    kept=0
     if prune:
-        for k in [k for k,v in by_id.items()
-                  if v.get("type")=="project" and not os.path.isdir(v.get("path",""))]:
+        doomed=[]
+        for k,v in list(by_id.items()):
+            path=v.get("path","")
+            here=os.path.isdir(path) if v.get("type")=="project" else os.path.isfile(path)
+            if here: continue
+            if _root_unavailable(path): kept+=1; continue
+            doomed.append(k)
+        for k in doomed:
             by_id.pop(k,None); dropped+=1
-        for k in [k for k,v in by_id.items()
-                  if v.get("type")=="archive" and not os.path.isfile(v.get("path",""))]:
-            by_id.pop(k,None); dropped+=1
-    return moved, dropped
+    return moved,dropped,deduped,kept
+
+def reclassify(by_id, dry_run=False):
+    """Recompute category / faction / source / labels for every entry from the rules
+    file as it stands NOW. Catalog only: no folder is walked, no model file is
+    opened, no thumbnail is touched. Editing rules.json used to require a full
+    rescan, because classification only ever happened at scan time.
+    Returns a list of (item, before, after) for everything that changed."""
+    changed=[]
+    for it in by_id.values():
+        cat,fac,src,tags=classify(it.get("path",""), it.get("name",""))
+        newtags=(tags
+                 +["format:"+f for f in (it.get("formats") or [])]
+                 +["source:"+src,"packed:"+("true" if it.get("packed") else "false")])
+        before=(it.get("category"),it.get("faction"),it.get("source"),list(it.get("tags") or []))
+        after=(cat,fac,src,newtags)
+        if before!=after: changed.append((it,before,after))
+        if not dry_run:
+            it["category"]=cat; it["faction"]=fac; it["source"]=src; it["tags"]=newtags
+    return changed
+
+def print_reclassify_report(changed, total, examples=12):
+    fields=("category","faction","source","labels")
+    hits={f:0 for f in fields}
+    for _it,b,a in changed:
+        for i,f in enumerate(fields):
+            if b[i]!=a[i]: hits[f]+=1
+    print(f"\n{len(changed):,} of {total:,} entries change under the current rules:")
+    for f in fields: print(f"  {hits[f]:>7,}  {f}")
+    if changed:
+        print("\nexamples:")
+        for it,b,a in changed[:examples]:
+            dn,_c,_bc=_display_fields(it.get("path",""))
+            bits=[]
+            for i,f in enumerate(("category","faction","source")):
+                if b[i]!=a[i]: bits.append(f"{f}: {b[i] or '—'} -> {a[i] or '—'}")
+            if b[3]!=a[3]:
+                gone=[t for t in b[3] if t not in a[3]]; new=[t for t in a[3] if t not in b[3]]
+                if gone: bits.append("-"+", -".join(gone))
+                if new: bits.append("+"+", +".join(new))
+            print(f"  {dn}")
+            for x in bits: print(f"      {x}")
+        if len(changed)>examples: print(f"  ... and {len(changed)-examples:,} more")
 
 def write_catalog(by_id):
     items=list(by_id.values())
@@ -551,19 +906,20 @@ def write_catalog(by_id):
                    "archives":sum(1 for i in items if i["type"]=="archive"),
                    "thumbnails_rendered":sum(1 for i in items if i.get("thumbnail"))},
          "items":items}
-    json.dump(cat, open(CATALOG,"w"), indent=1)
-    cols=["id","type","name","display_name","collection","breadcrumb","primary_file","all_files","fingerprint","category","faction","source","packed","part_count","formats","size_bytes","size_mb","path","thumbnail","thumb_status","tags"]
-    with open(CSVFILE,"w",newline="",encoding="utf-8") as fp:
-        w=csv.writer(fp); w.writerow(cols)
-        for it in items:
-            dn,col,bc=_display_fields(it["path"])
-            mfs=it.get("model_files") or []
-            pf=(mfs[0] if mfs else os.path.basename(it["path"]))
-            w.writerow([it["id"],it["type"],it["name"],dn,col,bc,pf,"|".join(mfs[:25]),
-                        _fingerprint(it) or "",it["category"],it.get("faction") or "",
-                        it["source"],it["packed"],it.get("part_count") if it.get("part_count") is not None else "",
-                        "|".join(it.get("formats",[])),it["size_bytes"],round(it["size_bytes"]/1e6,2),
-                        it["path"],it.get("thumbnail") or "",it.get("thumb_status",""),"|".join(it.get("tags",[]))])
+    backup_catalog()
+    atomic_write(CATALOG, json.dumps(cat, indent=1))
+    cols=["id","type","name","display_name","collection","breadcrumb","primary_file","all_files","fingerprint","category","faction","source","packed","part_count","formats","size_bytes","size_mb","path","thumbnail","thumb_status","thumb_error","tags"]
+    buf=io.StringIO(); w=csv.writer(buf); w.writerow(cols)   # built in memory, written once
+    for it in items:
+        dn,col,bc=_display_fields(it["path"])
+        mfs=it.get("model_files") or []
+        w.writerow([it["id"],it["type"],it["name"],dn,col,bc,primary_file(it),"|".join(mfs[:25]),
+                    _fingerprint(it) or "",it["category"],it.get("faction") or "",
+                    it["source"],it["packed"],it.get("part_count") if it.get("part_count") is not None else "",
+                    "|".join(it.get("formats",[])),it["size_bytes"],round(it["size_bytes"]/1e6,2),
+                    it["path"],it.get("thumbnail") or "",it.get("thumb_status",""),
+                    it.get("thumb_error") or "","|".join(it.get("tags",[]))])
+    atomic_write(CSVFILE, buf.getvalue())
 
 _FALLBACK_GENERIC={"files","file","parts","part","stl","stls","meshes","mesh","obj","output",
  "export","supported","presupported","unsupported","supports","print","prints","split","cut",
@@ -620,13 +976,16 @@ def write_gallery(by_id):
     for it in by_id.values():
         dn,col,bc=_display_fields(it["path"])
         mfs=it.get("model_files") or []
-        pf=(mfs[0] if mfs else os.path.basename(it["path"]))
+        pf=primary_file(it)
         slim.append({"n":dn,"c":it["category"],"f":it.get("faction") or "","s":it["source"],
             "col":col,"bc":bc,"p":1 if it.get("packed") else 0,"pc":it.get("part_count") or 0,
             "mb":round(it["size_bytes"]/1e6,1),"t":it.get("thumbnail") or "","path":it["path"],
+            "ts":it.get("thumb_status") or "","te":it.get("thumb_error") or "",
             "pf":pf,"nf":len(mfs),
             "tags":[x for x in it.get("tags",[]) if x.startswith("type:")]})
-    data=json.dumps(slim,separators=(",",":"))
+    # "</" cannot appear in a Windows path, but it can on other platforms, and it
+    # would close the <script> element early. Escaping it keeps the page valid.
+    data=json.dumps(slim,separators=(",",":")).replace("</","<\\/")
     html='''<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>3D Print Library</title>
 <style>
@@ -699,11 +1058,22 @@ button.more-btn{background:var(--acc);color:#08122a;border:0;border-radius:8px;p
 <script>
 const DATA=''' + data + ''';
 const $=s=>document.querySelector(s);
+const esc=t=>String(t==null?"":t).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+// why a card has no picture — the same vocabulary the CSV and --diagnose use
+const TSLABEL={cloud_only:"online-only, not downloaded",missing:"files not found",
+ too_big:"skipped — too large",no_model_file:"no model file",unsupported:"CAD file — no converter",
+ timeout:"render timed out",failed:"render failed",pending:"not rendered yet",
+ packed:"packed .zip",reused:"artist's preview",shell:"Windows handler",mesh:"rendered mesh",
+ existing:"rendered earlier"};
+const tsText=d=>TSLABEL[d.ts]||"no thumbnail yet";
 function opts(sel,vals){vals=[...new Set(vals)].filter(Boolean).sort();for(const v of vals){const o=document.createElement("option");o.value=v;o.textContent=v;sel.appendChild(o)}}
 opts($("#cat"),DATA.map(d=>d.c));
 opts($("#fac"),DATA.map(d=>d.f));
 opts($("#src"),DATA.map(d=>d.s));
 opts($("#col"),DATA.map(d=>d.col));
+// one extra entry in the thumbnail filter for each problem actually present
+for(const v of [...new Set(DATA.filter(d=>!d.t&&!d.p).map(d=>d.ts).filter(Boolean))].sort()){
+ const o=document.createElement("option");o.value="st:"+v;o.textContent="\u2937 "+(TSLABEL[v]||v);$("#th").appendChild(o);}
 let filtered=[],shown=0,PAGE=120,lastG=null,gkey="";
 const GLABEL={col:"collection",f:"faction",c:"category",s:"source"};
 function apply(){
@@ -713,6 +1083,7 @@ function apply(){
    if(c&&d.c!==c)return false; if(f&&d.f!==f)return false; if(s&&d.s!==s)return false;
    if(col&&d.col!==col)return false; if(pk!==""&&String(d.p)!==pk)return false;
    if(th==="1"&&!d.t)return false; if(th==="0"&&d.t)return false;
+   if(th.slice(0,3)==="st:"&&d.ts!==th.slice(3))return false;
    if(q&&!(d.n.toLowerCase().includes(q)||d.path.toLowerCase().includes(q)||(d.col||"").toLowerCase().includes(q)))return false;
    return true;});
  if(gkey)filtered.sort((a,b)=>String(a[gkey]).localeCompare(String(b[gkey]))||a.n.localeCompare(b.n));
@@ -724,16 +1095,16 @@ function render(){
    if(gkey){const gv=d[gkey]||"(none)";if(gv!==lastG){lastG=gv;const h=document.createElement("div");h.className="ghead";
      h.innerHTML=`${gv} <span class=gc>· ${GLABEL[gkey]}</span>`;g.appendChild(h);}}
    const c=document.createElement("div");c.className="card";c.dataset.i=i;
-   const thumb=d.t?`<img loading="lazy" src="thumbnails/${d.t}">`:`<div class="ph">${d.p?'\\u{1F4E6} packed .zip':'no thumbnail yet'}</div>`;
-   const fac=d.f?`<span class="tag fac">${d.f}</span>`:"";
-   const types=(d.tags||[]).map(t=>`<span class="tag">${t.replace('type:','')}</span>`).join("");
+   const thumb=d.t?`<img loading="lazy" src="thumbnails/${d.t}">`:`<div class="ph">${d.p?'\\u{1F4E6} packed .zip':esc(tsText(d))}</div>`;
+   const fac=d.f?`<span class="tag fac">${esc(d.f)}</span>`:"";
+   const types=(d.tags||[]).map(t=>`<span class="tag">${esc(t.replace('type:',''))}</span>`).join("");
    // only show the collection if it isn't just the item's own name repeated
    const colTxt=(d.col&&d.col!=="(none)"&&d.col.toLowerCase()!==d.n.toLowerCase())?d.col:"";
    const crumbTxt=[colTxt,d.bc].filter(Boolean).join(" › ");
-   const crumb=crumbTxt?`<div class="crumb" title="${d.path}">${crumbTxt}</div>`:"";
+   const crumb=crumbTxt?`<div class="crumb" title="${esc(d.path)}">${esc(crumbTxt)}</div>`:"";
    c.innerHTML=`<div class="thumb">${thumb}<span class="badge">${d.p?'zip':d.pc+'p'}</span></div>
-   <div class="body"><div class="nm" title="${d.path}">${d.n}</div>${crumb}
-   <div class="meta"><span class="tag">${d.c}</span>${fac}<span class="tag">${d.s}</span>${types}<span class="tag">${d.mb}MB</span></div>
+   <div class="body"><div class="nm" title="${esc(d.path)}">${esc(d.n)}</div>${crumb}
+   <div class="meta"><span class="tag">${esc(d.c)}</span>${fac}<span class="tag">${esc(d.s)}</span>${types}<span class="tag">${d.mb}MB</span></div>
    <div class="find">
      <button data-cp="${encodeURIComponent(d.pf)}" title="Copy exact filename — paste into Windows/Everything search:&#10;${d.pf}">copy filename</button>
      <button data-cp="${encodeURIComponent(d.path)}" title="Copy full folder path — paste into Explorer's address bar:&#10;${d.path}">copy path</button>
@@ -770,8 +1141,9 @@ function openLB(d){
    ["Category",d.c],["Faction",d.f||"—"],["Source",d.s],
    ["Kind",d.p?"packed .zip (not extracted)":"extracted files"],
    ["Parts",d.p?"—":d.pc],["Size",d.mb+" MB"],["Main file",d.pf||"—"],
+   ["Picture",tsText(d)+(d.te?" — "+d.te:"")],
    ["Labels",(d.tags||[]).map(t=>t.replace("type:","")).join(", ")||"—"]];
- $("#lbtab").innerHTML=rows.map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join("");
+ $("#lbtab").innerHTML=rows.map(r=>`<tr><td>${esc(r[0])}</td><td>${esc(r[1])}</td></tr>`).join("");
  $("#lb").classList.add("on");
 }
 function closeLB(){$("#lb").classList.remove("on");lbCur=null;}
@@ -787,7 +1159,7 @@ $("#lbcf").onclick=()=>{if(lbCur)copyText(lbCur.pf,$("#lbcf"));};
 $("#lbcp").onclick=()=>{if(lbCur)copyText(lbCur.path,$("#lbcp"));};
 apply();
 </script></body></html>'''
-    open(os.path.join(LIB,"gallery.html"),"w",encoding="utf-8").write(html)
+    atomic_write(os.path.join(LIB,"gallery.html"), html)
 
 def write_import(by_id):
     import base64, urllib.parse
@@ -810,11 +1182,12 @@ def write_import(by_id):
             tp=os.path.join(THUMBS,thumb)
             if os.path.exists(tp):
                 imgid="img-"+mid
-                images.append({"id":imgid,"modelId":mid,"data":base64.b64encode(open(tp,"rb").read()).decode()})
+                with open(tp,"rb") as fp: blob=fp.read()
+                images.append({"id":imgid,"modelId":mid,"data":base64.b64encode(blob).decode()})
                 m["imageId"]=imgid
         models.append(m)
     backup={"schema":2,"exportedAt":"updated","models":models,"images":images,"spools":[],"jobs":[]}
-    json.dump(backup, open(os.path.join(LIB,"print-tracker-import.json"),"w"))
+    atomic_write(os.path.join(LIB,"print-tracker-import.json"), json.dumps(backup))
 
 # Windows cloud-file attribute flags — detect "online-only" WITHOUT opening the
 # file (opening an online-only file would force Dropbox to download it).
@@ -836,7 +1209,7 @@ def compare_engines(items, n=6, max_mb=60):
     cand=[it for it in items
           if it.get("type")=="project" and it.get("model_files")
           and 0 < it.get("size_bytes",0) <= max_mb*1e6
-          and _hydrated(os.path.join(it["path"], it["model_files"][0])) is True]
+          and _hydrated_parts(it)[0]]
     if not cand:
         print(f"No downloaded projects under {max_mb} MB found. Try --compare-engines {n} --max-mb 200")
         return
@@ -851,23 +1224,25 @@ def compare_engines(items, n=6, max_mb=60):
         dn,_c,bc=_display_fields(it["path"]); mb=it.get("size_bytes",0)/1e6
         print(f"  [{i}/{len(picked)}] {dn}  ({it.get('part_count') or '?'} parts, {mb:.1f} MB)", flush=True)
         res={}
+        hyd,_c,_g=_hydrated_parts(it)     # downloaded parts only — never pull one down
+        renderable=[q for q in hyd if os.path.splitext(q)[1].lower() not in UNRENDERABLE]
         for eng in ("shell","mesh"):
             p=os.path.join(outdir, f"{it['id']}_{eng}.webp")
-            ts=time.time()
+            ts=time.time(); why=None
             if eng=="shell":
                 best=None;bestsz=-1
-                for f in it["model_files"]:
-                    fp=os.path.join(it["path"],f)
-                    if _hydrated(fp) is not True: continue
+                for fp in renderable:
                     try: sz=os.path.getsize(fp)
                     except OSError: continue
                     if sz>bestsz: bestsz=sz; best=fp
                 ok=bool(best and _shell_thumb(best,p))
+                if not ok: why="no Windows thumbnail handler for this file"
             else:
-                ok=bool(_render([os.path.join(it["path"],f) for f in it["model_files"]], p))
+                ok,why=_render(renderable, p)
             dt=time.time()-ts
             res[eng]=(ok,dt,os.path.basename(p) if ok else None)
-            print(f"        {eng:5} {'ok  ' if ok else 'FAIL'} {dt:5.1f}s", flush=True)
+            print(f"        {eng:5} {'ok  ' if ok else 'FAIL'} {dt:5.1f}s"
+                  f"{'' if ok else '   '+str(why or '')}", flush=True)
         rows.append((it,dn,bc,mb,res))
     cells=[]
     for it,dn,bc,mb,res in rows:
@@ -898,10 +1273,11 @@ def compare_engines(items, n=6, max_mb=60):
     print("  python update_catalog.py --thumbs-only --force --engine mesh")
 
 def sample_render(items, n, engine="shell"):
+    _ensure_dirs()
     outdir=os.path.join(LIB,"_render_test"); os.makedirs(outdir,exist_ok=True)
     cand=[it for it in items if it.get("type")=="project" and it.get("model_files")]
     cand.sort(key=lambda it:-it.get("size_bytes",0))
-    hyd=[it for it in cand if _hydrated(os.path.join(it["path"], it["model_files"][0])) is True]
+    hyd=[it for it in cand if _hydrated_parts(it)[0]]
     # Spread the sample across the size range (biggest -> smallest) so it's fast AND
     # representative, instead of only the slowest giant meshes.
     if len(hyd)<=n:
@@ -925,9 +1301,10 @@ def sample_render(items, n, engine="shell"):
         dn,_col,_bc=_display_fields(it["path"])
         print(f"  [{i}/{len(picked)}] {dn}  ({it.get('part_count') or '?'} parts, {mb:.0f} MB)...", flush=True)
         ts=time.time()
-        status=_thumb_for(it, newp, engine); okr=status in ("shell","mesh","reused")
+        status,detail=_thumb_for(it, newp, engine)
         dt=time.time()-ts; times.append(dt); avg=sum(times)/len(times); left=(len(picked)-i)*avg
-        print(f"        {status} in {dt:.1f}s   (avg {avg:.1f}s/file, ~{left:.0f}s left)", flush=True)
+        print(f"        {status} in {dt:.1f}s   (avg {avg:.1f}s/file, ~{left:.0f}s left)"
+              f"{chr(10)+'        '+detail if detail else ''}", flush=True)
         rows.append((it, it["id"]+".webp", old_exists))
     cells=[]
     for it,newf,has_old in rows:
@@ -972,11 +1349,10 @@ def diagnose(items):
     pending=[it for it in projects if not os.path.exists(os.path.join(THUMBS,it["id"]+".webp"))]
     hyd=cloud=missing=nofile=0; sample=[]
     for it in pending:
-        mfs=it.get("model_files") or []
-        if not mfs: nofile+=1; continue
-        st=_hydrated(os.path.join(it["path"],mfs[0]))
-        if st is True: hyd+=1
-        elif st is False:
+        if not (it.get("model_files") or []): nofile+=1; continue
+        parts,cl,gone=_hydrated_parts(it)
+        if parts: hyd+=1
+        elif cl:
             cloud+=1
             if len(sample)<3: sample.append(it["path"])
         else: missing+=1
@@ -988,6 +1364,7 @@ def diagnose(items):
     if sample:
         print("  examples still in the cloud:")
         for p in sample: print("    ",p)
+    print_status_summary(items, prefix="")
     print("")
     if not libs_ok:
         print("=> ACTION: install the render libraries, then run this again:")
@@ -1028,11 +1405,20 @@ def main():
     ap.add_argument("--sources",action="store_true",help="list the folders this library scans")
     ap.add_argument("--add-source",metavar="PATH",help="add a folder to the scan list")
     ap.add_argument("--remove-source",metavar="PATH",help="remove a folder from the scan list (does not delete files or entries)")
+    ap.add_argument("--reclassify",action="store_true",help="recompute category/faction/source/labels for every entry from the current rules.json - no scan, no rendering")
+    ap.add_argument("--dry-run",action="store_true",help="with --reclassify: show what would change and write nothing")
+    ap.add_argument("--restore-backup",nargs="?",const="",default=None,metavar="FILE",help="put a backup from backups/ back in place as catalog.json (newest if no name given)")
+    ap.add_argument("--backup",action="store_true",help="copy catalog.json into backups/ right now")
     a=ap.parse_args()
+    _ensure_dirs()
     jobs = a.jobs if a.jobs>0 else min(6, max(1,(os.cpu_count() or 2)-1))
-    by_id={}
-    if os.path.exists(CATALOG):
-        for it in json.load(open(CATALOG))["items"]: by_id[it["id"]]=it
+    if a.restore_backup is not None:
+        restore_backup(a.restore_backup or None); return
+    if a.backup:
+        b=backup_catalog(force=True)
+        print(f"backed up to {b}" if b else "nothing to back up yet (no catalog.json)")
+        return
+    by_id=load_catalog()
     print(f"loaded {len(by_id)} existing items")
     if a.diagnose:
         diagnose(list(by_id.values())); return
@@ -1058,11 +1444,28 @@ def main():
             print(f"Removed from scan list: {p}")
             print("Existing catalog entries were kept. To drop them too, use option 9 / --relocate --prune")
         show_sources(by_id); return
+    if a.reclassify:
+        changed=reclassify(by_id, dry_run=a.dry_run)
+        print_reclassify_report(changed, len(by_id))
+        if a.dry_run:
+            print("\ndry run - nothing was written. Drop --dry-run to apply.")
+        elif changed:
+            write_catalog(by_id); write_gallery(by_id); write_import(by_id)
+            print("\ncatalog, gallery and spreadsheet rebuilt. No files were scanned or rendered.")
+        else:
+            print("\nnothing to do - the catalog already matches the rules.")
+        return
     if a.relocate or (a.prune and not a.folders and not a.rescan_all and not a.thumbs_only):
-        moved,dropped=relocate_and_prune(by_id, prune=a.prune)
+        moved,dropped,deduped,kept=relocate_and_prune(by_id, prune=a.prune)
         write_catalog(by_id); write_gallery(by_id); write_import(by_id)
-        print(f"relocated {moved} moved project(s); pruned {dropped}; views rebuilt.")
-        if not moved and not dropped:
+        bits=[f"relocated {moved} moved project(s)", f"pruned {dropped}"]
+        if deduped: bits.append(f"merged {deduped} duplicate entr(ies)")
+        print("; ".join(bits)+"; views rebuilt.")
+        if kept:
+            print(f"\n  {kept} entr(ies) were NOT pruned: the folder they live under is not")
+            print( "  reachable right now. An unplugged drive or a cloud folder that has not")
+            print( "  mounted is not the same as deleted files. Reconnect it and run again.")
+        if not (moved or dropped or deduped or kept):
             print("nothing moved that I could match. If a folder moved, scan its NEW location first:")
             print('   python update_catalog.py "D:\\path\\to\\new\\location"')
         return
@@ -1110,6 +1513,10 @@ Or use these directly:
   "D:\\some\\folder"          add/rescan a folder into the library
   --relocate                 fix entries whose files moved (keeps thumbnails)
   --relocate --prune         also delete entries whose files are gone
+  --reclassify               re-apply rules.json to everything already catalogued
+  --reclassify --dry-run     ...show what that would change, and write nothing
+  --backup                   copy catalog.json into backups/ right now
+  --restore-backup           put the newest backups/ copy back as catalog.json
   --sample 8                 preview 8 thumbnails into _render_test/
 Useful extras:  --jobs N (cores)   --max-mb N (skip huge)   --engine shell|mesh
 """.strip()); return
@@ -1123,10 +1530,13 @@ Useful extras:  --jobs N (cores)   --max-mb N (skip huge)   --engine shell|mesh
                 if k in by_id: by_id[k].update(v); updated+=1
                 else: by_id[k]=v; added+=1
     print(f"merged: {added} new, {updated} updated")
-    moved,dropped=relocate_and_prune(by_id, prune=a.prune)
-    if moved: print(f"  relocated {moved} moved project(s) — same id, thumbnail kept, no re-render")
+    moved,dropped,deduped,kept=relocate_and_prune(by_id, prune=a.prune)
+    if moved: print(f"  relocated {moved} moved project(s) — thumbnail kept, no re-render")
+    if deduped: print(f"  merged {deduped} duplicate entr(ies) pointing at the same folder")
     if dropped: print(f"  pruned {dropped} entr(ies) whose files no longer exist")
-    n=render_missing(list(by_id.values()), checkpoint=lambda: write_catalog(by_id), jobs=jobs, engine=a.engine)
+    if kept: print(f"  left {kept} entr(ies) alone — the folder they live under is not reachable")
+    n=render_missing(list(by_id.values()), checkpoint=lambda: write_catalog(by_id),
+                     jobs=jobs, engine=a.engine, max_mb=a.max_mb)
     write_catalog(by_id)
     print("refreshing gallery.html and print-tracker-import.json ...", flush=True)
     write_gallery(by_id); write_import(by_id)
