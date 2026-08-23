@@ -17,6 +17,8 @@ Built for the situation where you have tens of thousands of STLs spread across d
 - **Builds a self-contained `gallery.html`** — filter, search, group, and copy any item's filename or full path to your clipboard to go find it on disk.
 - **Exports `catalog.csv`** for spreadsheets, and `catalog.json` for anything else.
 
+Both the scan and the thumbnail run report progress as they go, with a time-left estimate that accounts for the fact that big meshes take longer than small ones.
+
 Strictly read-only on your model files. The only things it writes are its own catalog, gallery, and thumbnails.
 
 ## Why not just use Explorer

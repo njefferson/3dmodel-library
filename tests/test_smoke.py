@@ -10,7 +10,7 @@ and that the paths nobody had ever executed do what they claim.
 The library the tests build lives in a temp folder (LIBRARY_DIR), so nothing is
 written next to the script and no real catalog is ever touched.
 """
-import contextlib, importlib, io, json, os, shutil, struct, sys, tempfile, unittest
+import contextlib, importlib, io, json, os, random, shutil, struct, sys, tempfile, unittest
 from unittest import mock
 
 def read(path):
@@ -132,6 +132,102 @@ class TestOutputs(LibraryCase):
         for fragment in ("${esc(d.n)}", "${esc(d.path)}", "${esc(d.c)}", "esc(tsText(d))"):
             # assertTrue, not assertIn: a failed assertIn prints the whole page
             self.assertTrue(fragment in html, f"card field no longer escaped: {fragment}")
+
+
+class TestScanProgress(LibraryCase):
+
+    def test_a_long_scan_says_what_it_is_doing(self):
+        """A big cloud folder takes minutes to walk. Saying nothing for all of it
+        is indistinguishable from being stuck."""
+        uc._PROGRESS_EVERY = 0        # every folder, so a tiny fixture shows it
+        try:
+            out = self.scan()
+        finally:
+            uc._PROGRESS_EVERY = 2.0
+        self.assertIn("folders \u00b7", out)
+        self.assertIn("projects \u00b7", out)
+        self.assertIn("done:", out)
+        self.assertIn("Ctrl+C is safe here", out)
+
+    def test_an_unreadable_folder_is_skipped_and_counted(self):
+        blocked = os.path.join(self.models, "locked")
+        os.makedirs(blocked)
+        os.chmod(blocked, 0o000)
+        try:
+            out = self.scan()
+        finally:
+            os.chmod(blocked, 0o755)
+        self.assertEqual(len(self.projects()), 2, "the readable kits should still be there")
+        if os.geteuid() != 0:          # root can read it anyway
+            self.assertIn("could not be read", out)
+
+
+class TestTimeRemaining(unittest.TestCase):
+    """The estimate used to divide elapsed time by items finished. Render cost is a
+    fixed overhead plus something proportional to mesh size, and the queue is sorted
+    smallest-first, so that estimate chased a rising average all run and kept being
+    revised upward."""
+
+    def setUp(self):
+        self.real_time = uc.time.time
+        self.now = 0.0
+        uc.time.time = lambda: self.now
+
+    def tearDown(self):
+        uc.time.time = self.real_time
+
+    def synthetic_run(self, overhead, per_mb, n=300, seed=7, biggest_first=False):
+        rnd = random.Random(seed)
+        sizes = sorted(int(10 ** rnd.uniform(4.5, 8.5)) for _ in range(n))
+        costs = [overhead + (s / 1e6) * per_mb * rnd.uniform(0.8, 1.3) for s in sizes]
+        if biggest_first: sizes, costs = sizes[::-1], costs[::-1]
+        return [{"size_bytes": s} for s in sizes], costs
+
+    def test_it_says_nothing_until_it_knows_something(self):
+        targets, costs = self.synthetic_run(0.4, 0.05)
+        eta = uc._Eta(targets)
+        self.assertEqual(eta.summary(), "")
+        for it, c in list(zip(targets, costs))[:3]:
+            self.now += c; eta.add(it)
+        self.assertEqual(eta.summary(), "", "guessed from three items")
+
+    def test_the_estimate_tracks_the_truth_on_a_smallest_first_queue(self):
+        targets, costs = self.synthetic_run(0.4, 0.05)
+        total = sum(costs)
+        eta = uc._Eta(targets)
+        errors = []
+        for k, (it, c) in enumerate(zip(targets, costs), 1):
+            self.now += c; eta.add(it)
+            if eta.eta is not None and k <= len(targets) * 0.9:
+                errors.append(abs(eta.eta - (total - self.now)))
+        self.assertTrue(errors, "never produced an estimate at all")
+        mean = sum(errors) / len(errors)
+        # the per-item estimator this replaced averaged >80% of total runtime out
+        self.assertLess(mean, total * 0.15, f"mean error {mean:.0f}s of a {total:.0f}s run")
+
+    def test_it_never_reports_something_impossible(self):
+        targets, costs = self.synthetic_run(0.4, 0.05, n=60, biggest_first=True)
+        eta = uc._Eta(targets)
+        for it, c in zip(targets, costs):
+            self.now += c; eta.add(it)
+            self.assertGreaterEqual(eta.eta if eta.eta is not None else 0, 0)
+            self.assertGreaterEqual(eta.percent(), 0)
+            self.assertLessEqual(eta.percent(), 100)
+
+    def test_it_reads_100_percent_when_it_is_actually_finished(self):
+        targets, costs = self.synthetic_run(0.4, 0.05, n=40)
+        eta = uc._Eta(targets)
+        for it, c in zip(targets, costs):
+            self.now += c; eta.add(it)
+        self.assertEqual(eta.eta, 0.0)
+        self.assertEqual(round(eta.percent()), 100)
+
+    def test_durations_are_coarse_enough_not_to_twitch(self):
+        self.assertEqual(uc._dur(0), "0s")
+        self.assertEqual(uc._dur(89), "89s")
+        self.assertEqual(uc._dur(90), "1m")
+        self.assertEqual(uc._dur(3600), "60m")
+        self.assertEqual(uc._dur(5400), "1h30m")
 
 
 class TestNothingFailsSilently(LibraryCase):

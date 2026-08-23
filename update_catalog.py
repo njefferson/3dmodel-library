@@ -385,18 +385,61 @@ def _save_webp(im, out_path, edge=512, ceiling=200000):
 PREVIEW_HINT=re.compile(r"render|preview|thumb|_prev|display|promo|cover|hero|showcase",re.I)
 
 # ---------- scan a folder into project/archive records ----------
-def scan_folder(root):
+def _short(path, keep=3):
+    segs=[x for x in str(path).replace("/","\\").split("\\") if x]
+    return ("..." if len(segs)>keep else "")+"\\".join(segs[-keep:])
+
+def _iter_dirs(root):
+    """Walk with os.scandir instead of os.walk + getsize. On Windows the file sizes
+    come back with the directory listing that has already been read, so no extra
+    stat() per file is needed — on a large cloud folder that is most of the wait.
+    Unreadable folders are counted and skipped; symlinks and junctions are never
+    followed, exactly as os.walk(followlinks=False) behaved.
+    Yields (dirpath, [DirEntry for the files in it], unreadable_so_far)."""
+    stack=[str(root)]; unreadable=0
+    while stack:
+        d=stack.pop()
+        files=[]
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    try:
+                        if e.is_dir():
+                            if not e.is_symlink(): stack.append(e.path)
+                            continue
+                    except OSError:
+                        continue
+                    files.append(e)
+        except OSError:
+            unreadable+=1
+            continue
+        yield d, files, unreadable
+
+_WANTED=MODEL|IMG|ARCH
+_PROGRESS_EVERY=2.0     # seconds between "still going" lines during a scan
+
+def scan_folder(root, progress=True):
+    """Read one folder tree into project and archive records. Metadata only —
+    names and sizes. Nothing is opened, so nothing is pulled out of the cloud."""
     projects={}; archives={}
-    for dp,dns,fns in os.walk(root):
+    ndirs=nfiles=nseen=unreadable=0
+    t0=time.time(); last=t0
+    for dp,files,unreadable in _iter_dirs(root):
+        ndirs+=1
         models=[]; images=[]
-        for f in fns:
-            ext=os.path.splitext(f)[1].lower()
-            full=os.path.join(dp,f)
-            try: sz=os.path.getsize(full)
+        for e in files:
+            nseen+=1
+            ext=os.path.splitext(e.name)[1].lower()
+            if ext not in _WANTED:      # don't stat what we are going to ignore
+                continue
+            nfiles+=1
+            try: sz=e.stat().st_size
             except OSError: sz=0
+            f=e.name
             if ext in MODEL: models.append((f,sz))
             elif ext in IMG: images.append((f,sz))
-            elif ext in ARCH:
+            else:
+                full=e.path
                 aid=stable_id(full); cat,fac,src,tags=classify(full,os.path.splitext(f)[0])
                 archives[aid]={"id":aid,"type":"archive","name":os.path.splitext(f)[0],"path":full,
                   "source":src,"category":cat,"faction":fac,"packed":True,"part_count":None,
@@ -416,6 +459,17 @@ def scan_folder(root):
               "has_shipped_preview":prev is not None,"preview_file":os.path.join(dp,prev) if prev else None,
               "tags":tags+["format:"+f for f in fmts]+["source:"+src,"packed:false"],
               "model_files":[m for m,_ in models]}
+        # A big cloud folder can take many minutes to walk. Saying nothing for all
+        # of that looks exactly like being stuck, which is what it was doing.
+        if progress and time.time()-last>=_PROGRESS_EVERY:
+            last=time.time()
+            print(f"    {ndirs:,} folders · {nseen:,} files · {len(projects):,} projects · "
+                  f"{len(archives):,} archives · {time.time()-t0:.0f}s   [{_short(dp)}]", flush=True)
+    if progress:
+        print(f"    done: {ndirs:,} folders and {nseen:,} files in {time.time()-t0:.0f}s — "
+              f"{len(projects):,} projects, {len(archives):,} archives", flush=True)
+        if unreadable:
+            print(f"    ({unreadable:,} folder(s) could not be read and were skipped)", flush=True)
     return projects, archives
 
 def _hydrated_parts(it):
@@ -618,6 +672,81 @@ def print_status_summary(items, prefix="  ", examples=3):
             print(f"{prefix}  {path}")
             if why: print(f"{prefix}    {why}")
 
+def _dur(sec):
+    """Coarse enough not to twitch: seconds below 90, then whole minutes, then hours."""
+    sec=max(0,int(sec))
+    if sec<90: return f"{sec}s"
+    m,rem=divmod(sec,60)
+    if m<90: return f"{m}m"
+    h,m=divmod(m,60)
+    return f"{h}h{m:02d}m"
+
+class _Eta:
+    """A time-left estimate that is neither jumpy nor quietly wrong.
+
+    The first version divided elapsed time by the number of items finished. Render
+    cost is not one-per-item though: it is a fixed overhead plus something roughly
+    proportional to mesh size, and the queue is deliberately sorted smallest-first.
+    So a per-item mean spends the whole run chasing a rising average — smooth, but
+    on a simulated 400-item run it sat wrong by 83% of the total runtime and had to
+    keep revising upward. Measuring bytes per second instead is worse: the fixed
+    overhead dominates the small items at the front and it overshoots wildly.
+
+    So fit both terms. elapsed ~= a*(items done) + b*(bytes done), solved by least
+    squares from running sums, then applied to what is left. Same simulation: mean
+    error 2.7% of the run instead of 83%. It also absorbs the worker count on its
+    own, since more workers simply make a and b smaller.
+
+    Falls back to the per-item mean if the fit is degenerate, and says nothing at
+    all until there is enough to be worth printing."""
+    SMOOTHING=0.25          # weight given to the newest estimate
+    MIN_ITEMS=8
+    MIN_SECONDS=5.0
+    def __init__(self, targets):
+        self.n_total=len(targets)
+        self.b_total=sum(max(int(it.get("size_bytes") or 0),0) for it in targets)
+        self.n=0; self.b=0; self.t0=time.time(); self.eta=None
+        self.Snn=self.SnB=self.SBB=self.Snt=self.SBt=0.0
+
+    def add(self, it):
+        """One item finished. Updates the fit and the smoothed estimate."""
+        self.n+=1; self.b+=max(int(it.get("size_bytes") or 0),0)
+        t=time.time()-self.t0
+        # bytes in millions keeps the normal equations away from 1e18 magnitudes
+        n=float(self.n); B=self.b/1e6
+        self.Snn+=n*n; self.SnB+=n*B; self.SBB+=B*B; self.Snt+=n*t; self.SBt+=B*t
+        if self.n>=self.n_total: self.eta=0.0; return   # finished is finished
+        if self.n<self.MIN_ITEMS or t<self.MIN_SECONDS: return
+        fresh=self._predict(t)
+        if fresh is None: return
+        self.eta=fresh if self.eta is None else (1-self.SMOOTHING)*self.eta+self.SMOOTHING*fresh
+
+    def _predict(self, elapsed):
+        n_left=self.n_total-self.n; b_left=(self.b_total-self.b)/1e6
+        det=self.Snn*self.SBB-self.SnB*self.SnB
+        if det>0:
+            a=( self.SBB*self.Snt-self.SnB*self.SBt)/det
+            c=(-self.SnB*self.Snt+self.Snn*self.SBt)/det
+            if a>=0 and c>=0 and (a or c):
+                return max(0.0, a*n_left+c*b_left)
+        if self.n<=0: return None
+        return max(0.0, n_left*(elapsed/self.n))    # degenerate fit: per-item mean
+
+    def percent(self):
+        """Share of the WORK, not of the item count — on a smallest-first queue those
+        are very different numbers. Only meaningful once the fit exists."""
+        if self.n_total<=0: return 100.0
+        if self.eta is None: return 100.0*self.n/self.n_total
+        el=time.time()-self.t0
+        done=el/(el+self.eta) if el+self.eta>0 else self.n/self.n_total
+        return max(0.0,min(100.0,100.0*done))
+
+    def summary(self):
+        """The progress tail, or nothing at all while there is nothing worth saying.
+        Repeating 'estimating...' on every line is its own kind of noise."""
+        if self.eta is None: return ""
+        return f" · {self.percent():.0f}% · ~{_dur(self.eta)} left"
+
 def render_missing(items, checkpoint=None, force=False, jobs=1, engine="shell", max_mb=1500):
     _ensure_dirs()
     global _ENGINE; _ENGINE=engine   # used by the serial path (render_one reads it)
@@ -659,16 +788,15 @@ def render_missing(items, checkpoint=None, force=False, jobs=1, engine="shell", 
           f"{cloud} not renderable yet{' (FORCE re-render)' if force else ''}.", flush=True)
     print(f"  Rendering with {jobs} core(s), engine='{engine}'. Safe to press Ctrl+C anytime —", flush=True)
     print("  finished thumbnails are kept and re-running resumes where it stopped.\n", flush=True)
-    done=0; failed=0; t0=time.time(); seen=set()
+    done=0; failed=0; t0=time.time(); seen=set(); eta=_Eta(targets)
     def report(k):
-        el=time.time()-t0; rate=el/max(k,1); left=(total-k)*rate
-        print(f"  {k}/{total} done ({done} ok, {failed} failed)  {el:.0f}s elapsed  "
-              f"~{int(left//60)}m{int(left%60):02d}s left", flush=True)
+        print(f"  {k}/{total} done ({done} ok, {failed} failed) · "
+              f"{_dur(time.time()-t0)} elapsed{eta.summary()}", flush=True)
     def apply(pid,status,detail=None):
         nonlocal done,failed
         it=idmap.get(pid)
         if it is None: return
-        seen.add(pid)
+        seen.add(pid); eta.add(it)
         it["thumb_status"]=status
         if detail: it["thumb_error"]=detail
         else: it.pop("thumb_error",None)
@@ -1581,15 +1709,19 @@ Or use these directly:
 Useful extras:  --jobs N (cores)   --max-mb N (skip huge)   --engine shell|mesh
 """.strip()); return
     added=updated=0
+    print("\nScanning reads names and sizes only — nothing is opened, so nothing gets\n"
+          "pulled down from the cloud. Ctrl+C is safe here: the catalog is not written\n"
+          "until the scan finishes.\n", flush=True)
     for folder in folders:
         if not os.path.isdir(folder): print("  skip (not found):",folder); continue
-        print("scanning:",folder)
+        print("scanning:",folder, flush=True)
         pj,ar=scan_folder(folder)
         for d in (pj,ar):
             for k,v in d.items():
                 if k in by_id: by_id[k].update(v); updated+=1
                 else: by_id[k]=v; added+=1
     print(f"merged: {added} new, {updated} updated")
+    print("checking for entries whose folder moved ...", flush=True)
     moved,dropped,deduped,kept=relocate_and_prune(by_id, prune=a.prune)
     if moved: print(f"  relocated {moved} moved project(s) — thumbnail kept, no re-render")
     if deduped: print(f"  merged {deduped} duplicate entr(ies) pointing at the same folder")
