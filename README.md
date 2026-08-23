@@ -1,4 +1,4 @@
-# STL Library
+# 3D Model Library
 
 Catalog a large, messy 3D-printing collection into a browsable, searchable gallery — without moving, renaming, or touching a single one of your files.
 
@@ -33,8 +33,8 @@ Explorer shows you one folder at a time and can't tell you that the Warhound tit
 ## Install
 
 ```bash
-git clone https://github.com/YOURNAME/stl-library.git
-cd stl-library
+git clone https://github.com/njefferson/3dmodel-library.git
+cd 3dmodel-library
 pip install -r requirements.txt
 ```
 
@@ -113,7 +113,9 @@ Items are identified by a fingerprint of their contents (the set of model filena
 
 ## Privacy
 
-**Never commit your catalog.** `catalog.json` and `catalog.csv` contain absolute paths to everything you own, and `thumbnails/` holds rendered images of models you may have licensed for personal use only. The included `.gitignore` excludes all of it. Publish the tool, not your library.
+**Never commit your catalog.** `catalog.json` and `catalog.csv` contain absolute paths to everything you own. `gallery.html` is worse — it embeds the *entire* catalog inline as JSON, so a single file gives away your whole collection and folder structure. And `thumbnails/` holds rendered images of models you may have licensed for personal use only.
+
+The included `.gitignore` excludes all of it, plus `sources.txt` and `backups/`. Publish the tool, not your library. If you fork this and add features, check `git status` before your first commit.
 
 ## Known limitations
 
