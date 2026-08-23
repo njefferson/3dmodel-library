@@ -30,7 +30,7 @@ modified; this tool only ever reads them.
 REQUIREMENTS (one-time):
     pip install -r requirements.txt
 """
-import os, sys, json, csv, re, io, time, shutil, hashlib, signal, argparse, tempfile
+import os, sys, json, csv, re, io, time, shutil, hashlib, signal, argparse, tempfile, threading
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Where the catalog, thumbnails and backups live. Defaults to the script's own
@@ -416,7 +416,8 @@ def _iter_dirs(root):
         yield d, files, unreadable
 
 _WANTED=MODEL|IMG|ARCH
-_PROGRESS_EVERY=2.0     # seconds between "still going" lines during a scan
+_PROGRESS_EVERY=2.0     # seconds between "still going" lines
+_STALL_NOTICE=60.0      # after this long with nothing finishing, say so
 
 def scan_folder(root, progress=True):
     """Read one folder tree into project and archive records. Metadata only —
@@ -747,6 +748,33 @@ class _Eta:
         if self.eta is None: return ""
         return f" · {self.percent():.0f}% · ~{_dur(self.eta)} left"
 
+class _Ticker:
+    """Calls a function on a timer until stopped.
+
+    Progress used to be printed every 5 completions, which means it can only speak
+    when something finishes — so slow renders put minutes between lines, and one
+    enormous mesh produced total silence for as long as it took. A timer does not
+    care whether anything has finished."""
+    def __init__(self, fn, every=None):
+        self.fn=fn; self.every=every
+        self._stop=threading.Event(); self.lock=threading.Lock(); self._thread=None
+    def _interval(self):
+        return self.every if self.every is not None else _PROGRESS_EVERY
+    def start(self):
+        self._thread=threading.Thread(target=self._run, daemon=True)
+        self._thread.start(); return self
+    def _run(self):
+        while not self._stop.wait(max(self._interval(),0.01)):
+            try: self.emit()
+            except Exception: pass       # a progress line must never kill a run
+    def emit(self):
+        with self.lock: self.fn()
+    def stop(self):
+        self._stop.set()
+        if self._thread: self._thread.join(timeout=1.0)
+    def __enter__(self): return self.start()
+    def __exit__(self, *exc): self.stop()
+
 def render_missing(items, checkpoint=None, force=False, jobs=1, engine="shell", max_mb=1500):
     _ensure_dirs()
     global _ENGINE; _ENGINE=engine   # used by the serial path (render_one reads it)
@@ -789,36 +817,44 @@ def render_missing(items, checkpoint=None, force=False, jobs=1, engine="shell", 
     print(f"  Rendering with {jobs} core(s), engine='{engine}'. Safe to press Ctrl+C anytime —", flush=True)
     print("  finished thumbnails are kept and re-running resumes where it stopped.\n", flush=True)
     done=0; failed=0; t0=time.time(); seen=set(); eta=_Eta(targets)
-    def report(k):
-        print(f"  {k}/{total} done ({done} ok, {failed} failed) · "
-              f"{_dur(time.time()-t0)} elapsed{eta.summary()}", flush=True)
+    last_finish=[t0]
+    def report():
+        quiet=time.time()-last_finish[0]
+        stalled=f" · nothing finished for {_dur(quiet)}" if quiet>=_STALL_NOTICE else ""
+        print(f"  {len(seen)}/{total} done ({done} ok, {failed} failed) · "
+              f"{_dur(time.time()-t0)} elapsed{eta.summary()}{stalled}", flush=True)
+    ticker=_Ticker(report)
     def apply(pid,status,detail=None):
         nonlocal done,failed
         it=idmap.get(pid)
         if it is None: return
-        seen.add(pid); eta.add(it)
-        it["thumb_status"]=status
-        if detail: it["thumb_error"]=detail
-        else: it.pop("thumb_error",None)
-        if status in OK_STATUS: it["thumbnail"]=pid+".webp"; done+=1
-        else: failed+=1
-    if jobs>1 and total:
-        try:
-            import multiprocessing as mp
-            with mp.Pool(jobs, initializer=_init_worker, initargs=(engine,)) as pool:
-                for k,(pid,status,detail) in enumerate(pool.imap_unordered(render_one, targets, chunksize=1),1):
-                    apply(pid,status,detail)
-                    if k%5==0 or k==total: report(k)
-                    if checkpoint and (k%150==0 or k==50):
-                        checkpoint()
-                        print("   [gallery.html refreshed — you can open it now]", flush=True)
-        except Exception as e:
-            print(f"  [multi-core unavailable ({type(e).__name__}: {e}); continuing on a single core]\n", flush=True)
-    left=[it for it in targets if it["id"] not in seen]
-    for k,it in enumerate(left,1):
-        pid,status,detail=render_one(it); apply(pid,status,detail)
-        if k%5==0 or k==len(left): report(len(seen))
-        if checkpoint and done and done%100==0: checkpoint()
+        with ticker.lock:                # don't let a progress line print mid-update
+            seen.add(pid); eta.add(it); last_finish[0]=time.time()
+            it["thumb_status"]=status
+            if detail: it["thumb_error"]=detail
+            else: it.pop("thumb_error",None)
+            if status in OK_STATUS: it["thumbnail"]=pid+".webp"; done+=1
+            else: failed+=1
+    ticker.start()
+    try:
+        if jobs>1 and total:
+            try:
+                import multiprocessing as mp
+                with mp.Pool(jobs, initializer=_init_worker, initargs=(engine,)) as pool:
+                    for k,(pid,status,detail) in enumerate(pool.imap_unordered(render_one, targets, chunksize=1),1):
+                        apply(pid,status,detail)
+                        if checkpoint and (k%150==0 or k==50):
+                            checkpoint()
+                            print("   [gallery.html refreshed — you can open it now]", flush=True)
+            except Exception as e:
+                print(f"  [multi-core unavailable ({type(e).__name__}: {e}); continuing on a single core]\n", flush=True)
+        left=[it for it in targets if it["id"] not in seen]
+        for it in left:
+            pid,status,detail=render_one(it); apply(pid,status,detail)
+            if checkpoint and done and done%100==0: checkpoint()
+    finally:
+        ticker.stop()
+    if total: ticker.emit()
     print(f"\n  finished: {done}/{total} rendered in {time.time()-t0:.0f}s"
           f"{f', {failed} could not be rendered' if failed else ''}", flush=True)
     print_status_summary(items)

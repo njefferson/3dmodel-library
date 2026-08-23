@@ -10,7 +10,7 @@ and that the paths nobody had ever executed do what they claim.
 The library the tests build lives in a temp folder (LIBRARY_DIR), so nothing is
 written next to the script and no real catalog is ever touched.
 """
-import contextlib, importlib, io, json, os, random, shutil, struct, sys, tempfile, unittest
+import contextlib, importlib, io, json, os, random, shutil, struct, sys, tempfile, time, unittest
 from unittest import mock
 
 def read(path):
@@ -228,6 +228,74 @@ class TestTimeRemaining(unittest.TestCase):
         self.assertEqual(uc._dur(90), "1m")
         self.assertEqual(uc._dur(3600), "60m")
         self.assertEqual(uc._dur(5400), "1h30m")
+
+
+class TestProgressKeepsTalking(LibraryCase):
+    """Progress used to print every 5 completions, so it could only speak when
+    something finished. One enormous mesh meant silence for as long as it took."""
+
+    def slow_render(self, seconds):
+        def render(paths, out_path, timeout=25):
+            time.sleep(seconds)
+            with open(out_path, "wb") as fp: fp.write(b"x")
+            return (True, None)
+        return render
+
+    def test_a_single_slow_render_still_reports_while_it_runs(self):
+        self.scan()
+        items = self.projects()
+        for it in items:                      # start from nothing rendered
+            t = os.path.join(self.lib, "thumbnails", it["id"] + ".webp")
+            if os.path.exists(t): os.remove(t)
+        uc._PROGRESS_EVERY = 0.05
+        buf = io.StringIO()
+        try:
+            with mock.patch.object(uc, "_render", self.slow_render(0.4)), \
+                 mock.patch.object(uc, "_shell_thumb", return_value=False), \
+                 contextlib.redirect_stdout(buf):
+                uc.render_missing(items, jobs=1, engine="mesh")
+        finally:
+            uc._PROGRESS_EVERY = 2.0
+        lines = [l for l in buf.getvalue().splitlines() if "done (" in l]
+        self.assertGreater(len(lines), len(items),
+                           "fewer progress lines than items — still reporting per completion")
+
+    def test_it_says_when_nothing_has_finished_for_a_while(self):
+        self.scan()
+        items = self.projects()
+        for it in items:
+            t = os.path.join(self.lib, "thumbnails", it["id"] + ".webp")
+            if os.path.exists(t): os.remove(t)
+        uc._PROGRESS_EVERY, uc._STALL_NOTICE = 0.05, 0.2
+        buf = io.StringIO()
+        try:
+            with mock.patch.object(uc, "_render", self.slow_render(0.5)), \
+                 mock.patch.object(uc, "_shell_thumb", return_value=False), \
+                 contextlib.redirect_stdout(buf):
+                uc.render_missing(items, jobs=1, engine="mesh")
+        finally:
+            uc._PROGRESS_EVERY, uc._STALL_NOTICE = 2.0, 60.0
+        self.assertIn("nothing finished for", buf.getvalue())
+
+
+class TestTicker(unittest.TestCase):
+
+    def test_it_fires_on_a_timer_with_nothing_happening(self):
+        calls = []
+        t = uc._Ticker(lambda: calls.append(1), every=0.02).start()
+        time.sleep(0.2)
+        t.stop()
+        self.assertGreaterEqual(len(calls), 3)
+        after = len(calls)
+        time.sleep(0.1)
+        self.assertEqual(len(calls), after, "kept firing after stop()")
+
+    def test_a_broken_progress_line_cannot_kill_the_run(self):
+        def boom(): raise RuntimeError("no")
+        t = uc._Ticker(boom, every=0.02).start()
+        time.sleep(0.1)
+        t.stop()          # the thread must still be alive to be stopped cleanly
+        self.assertFalse(t._thread.is_alive())
 
 
 class TestNothingFailsSilently(LibraryCase):
