@@ -2091,7 +2091,9 @@ def diagnose(items):
     else:
         print("=> Everything that can be rendered already has a thumbnail.")
 
-def main():
+def build_parser():
+    """Every flag the tool accepts. Separate from main() so the tests can check
+    that LIBRARY.bat and library.sh only ever call flags that actually exist."""
     ap=argparse.ArgumentParser()
     ap.add_argument("folders",nargs="*")
     ap.add_argument("--rescan-all",action="store_true")
@@ -2117,6 +2119,10 @@ def main():
     ap.add_argument("--backup",action="store_true",help="copy catalog.json into backups/ right now")
     ap.add_argument("--unmatched",nargs="?",type=int,const=25,default=0,metavar="N",help="list entries no rule matched, with the part names inside them, to help write patterns")
     ap.add_argument("--duplicates",nargs="?",type=int,const=20,default=0,metavar="N",help="find kits catalogued more than once and write potential_duplicates.csv (reports only, deletes nothing)")
+    return ap
+
+def main():
+    ap=build_parser()
     a=ap.parse_args()
     _ensure_dirs()
     if a.style:

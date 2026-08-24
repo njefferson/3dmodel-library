@@ -10,7 +10,7 @@ and that the paths nobody had ever executed do what they claim.
 The library the tests build lives in a temp folder (LIBRARY_DIR), so nothing is
 written next to the script and no real catalog is ever touched.
 """
-import contextlib, importlib, io, json, os, random, shutil, struct, sys, tempfile, time, unittest
+import contextlib, importlib, io, json, os, random, re, shutil, struct, sys, tempfile, time, unittest
 from unittest import mock
 
 def read(path):
@@ -545,6 +545,77 @@ class TestRendering(unittest.TestCase):
         trimesh.Trimesh(vertices=m.vertices, faces=f, process=False).export(p)
         ok, note = uc._render([p], os.path.join(self.tmp, "scrambled.webp"))
         self.assertTrue(ok)
+
+
+class TestMenusMatchTheTool(unittest.TestCase):
+    """LIBRARY.bat and library.sh are the same menu for two platforms. Nothing stops
+    one gaining an option the other never gets, or either calling a flag that was
+    renamed — so this checks both against the real argument parser."""
+
+    BAT = os.path.join(ROOT, "LIBRARY.bat")
+    SH = os.path.join(ROOT, "library.sh")
+
+    def flags(self):
+        return {o for a in uc.build_parser()._actions for o in a.option_strings}
+
+    def invocations(self, path):
+        """Every --flag either menu passes to the tool. The shell menu goes through
+        a run() wrapper rather than naming the script on every line."""
+        used = set()
+        for line in read(path).splitlines():
+            st = line.strip()
+            if "update_catalog.py" in st:
+                tail = st.split("update_catalog.py", 1)[1]
+            elif st.startswith("run "):
+                tail = st[4:]
+            else:
+                continue
+            used.update(re.findall(r"--[a-z][a-z0-9-]*", tail))
+        return used
+
+    def options(self, path, pattern):
+        return {m.group(1).strip().lower()
+                for m in re.finditer(pattern, read(path), re.M)}
+
+    def test_both_menus_exist_and_the_shell_one_is_executable(self):
+        self.assertTrue(os.path.isfile(self.BAT))
+        self.assertTrue(os.path.isfile(self.SH))
+        if os.name != "nt":
+            self.assertTrue(os.access(self.SH, os.X_OK), "library.sh is not executable")
+
+    def test_every_flag_the_windows_menu_uses_really_exists(self):
+        unknown = self.invocations(self.BAT) - self.flags()
+        self.assertFalse(unknown, f"LIBRARY.bat calls flags that do not exist: {unknown}")
+
+    def test_every_flag_the_shell_menu_uses_really_exists(self):
+        unknown = self.invocations(self.SH) - self.flags()
+        self.assertFalse(unknown, f"library.sh calls flags that do not exist: {unknown}")
+
+    def test_the_two_menus_offer_the_same_things(self):
+        bat = self.invocations(self.BAT)
+        sh = self.invocations(self.SH)
+        self.assertFalse(bat - sh, f"only on Windows: {bat - sh}")
+        self.assertFalse(sh - bat, f"only in the shell menu: {sh - bat}")
+
+    def test_the_numbered_choices_are_the_same_on_both(self):
+        bat = self.options(self.BAT, r'if(?: /i)? "%c%"=="(\w+)"')   # letters use /i
+        sh = self.options(self.SH, r"^\s{4}([0-9]+|[a-zA-Z]\|[a-zA-Z])\)")
+        sh = {o.split("|")[0].lower() for o in sh}
+        bat = {o.lower() for o in bat}
+        self.assertTrue(bat, "found no choices in LIBRARY.bat")
+        self.assertTrue(sh, "found no choices in library.sh")
+        self.assertEqual(bat - {"q"}, sh - {"q"},
+                         "the two menus no longer offer the same numbered options")
+
+    @unittest.skipIf(os.name == "nt", "POSIX shell only")
+    def test_the_shell_menu_parses_and_quits_cleanly(self):
+        import subprocess
+        chk = subprocess.run(["sh", "-n", self.SH], capture_output=True, text=True)
+        self.assertEqual(chk.returncode, 0, chk.stderr)
+        run = subprocess.run(["sh", self.SH], input="Q\n", capture_output=True,
+                             text=True, timeout=30, cwd=ROOT)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("3D PRINT LIBRARY", run.stdout)
 
 
 class TestTicker(unittest.TestCase):

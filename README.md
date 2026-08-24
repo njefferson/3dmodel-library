@@ -30,7 +30,7 @@ Explorer shows you one folder at a time and can't tell you that the Warhound tit
 ## Requirements
 
 - Python 3.9+
-- Windows for the double-click menu (`LIBRARY.bat`). The Python script itself runs anywhere.
+- A menu is provided for every platform: double-click **`LIBRARY.bat`** on Windows, or run **`./library.sh`** on macOS and Linux. The Python script itself runs anywhere, with or without either.
 
 ## Install
 
@@ -51,11 +51,13 @@ python update_catalog.py --rescan-all
 
 That scans, classifies, renders thumbnails, and writes `gallery.html`. Open it in any browser.
 
-On Windows you can skip the commands entirely — double-click **`LIBRARY.bat`** for a numbered menu.
+You can skip the commands entirely — double-click **`LIBRARY.bat`** on Windows, or run **`./library.sh`** on macOS and Linux. Both are the same numbered menu, and every option runs the identical command, so everything below describes both.
 
 ---
 
 ## The menu
+
+`LIBRARY.bat` on Windows, `./library.sh` on macOS and Linux — same options, same commands:
 
 ```
 BROWSE           1  gallery          2  spreadsheet
@@ -233,7 +235,7 @@ The included `.gitignore` excludes all of it, plus `sources.txt` and `backups/`.
 - `.step`/`.stp` files are catalogued but not thumbnailed — no CAD converter is bundled. They are reported as `unsupported` rather than left blank.
 - `.rar` and `.7z` archives are indexed by name only — nothing here can read them.
 - Classification is keyword-based, so it is approximate. It reads the folder path first and the filenames inside as a fallback; it never opens a file to see what the model actually is. Edit `rules.json`, check with `--unmatched`, and apply with `--reclassify`.
-- `LIBRARY.bat` is Windows-only. Everything it does is available as a command elsewhere, and the Python script itself runs anywhere.
+- The two menus are kept in step by a test that checks both against the real argument parser: neither can call a flag that does not exist, and neither can gain an option the other lacks.
 
 ## License
 
