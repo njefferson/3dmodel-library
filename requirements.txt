@@ -10,10 +10,11 @@ matplotlib>=3.7
 networkx>=3.0
 charset-normalizer>=3.0
 
-# Not optional in practice. trimesh's own simplify_quadric_decimation() is
-# implemented ON TOP of this, so without it BOTH reduction paths fail and a
-# high-poly sculpt falls back to keeping every Nth triangle — which scatters the
-# surface into loose specks rather than simplifying it.
+# Required, not optional. trimesh's own simplify_quadric_decimation() is built on
+# top of this, so without it BOTH reduction paths fail and a high-poly sculpt
+# falls back to keeping every Nth triangle — which scatters the surface into
+# loose specks instead of simplifying it. Wheels exist for CPython 3.10-3.14 on
+# Windows, so pip installs it here without needing a compiler.
 fast-simplification>=0.1.7
 
 # Windows only — lets the tool try Windows' own thumbnail handler first.

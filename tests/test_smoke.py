@@ -471,6 +471,20 @@ class TestRendering(unittest.TestCase):
         self.assertIsNone(note, "fell back to striding when it did not need to")
         self.assertGreater(os.path.getsize(out), 0)
 
+    def test_an_oversized_mesh_is_really_reduced_not_strided(self):
+        """The trimesh reduction call took `percent` first, so passing a face count
+        positionally raised every time and the bare except hid it. This asserts the
+        reduction actually happens rather than that something merely rendered."""
+        import trimesh, numpy as np
+        big = trimesh.creation.icosphere(subdivisions=7)
+        self.assertGreater(len(big.faces), uc.RENDER_CAP)
+        reduced = big.simplify_quadric_decimation(face_count=uc.RENDER_CAP)
+        self.assertLessEqual(len(reduced.faces), uc.RENDER_CAP)
+        p = os.path.join(self.tmp, "big.stl"); big.export(p)
+        ok, note = uc._render([p], os.path.join(self.tmp, "big.webp"))
+        self.assertTrue(ok)
+        self.assertIsNone(note, "fell back to striding despite a working decimator")
+
     def test_each_style_actually_changes_the_picture(self):
         shots = {}
         for name in ("slate", "paper", "bronze"):

@@ -387,7 +387,11 @@ def _render(model_paths, out_path, timeout=0):
             for attempt in ("trimesh","fast_simplification"):
                 try:
                     if attempt=="trimesh":
-                        dm=mesh.simplify_quadric_decimation(RENDER_CAP)
+                        # face_count=, NOT positional: the first parameter is
+                        # `percent`, so simplify_quadric_decimation(16000) asked for
+                        # a 16000x reduction and raised every single time. The bare
+                        # except swallowed it, so this path had never once run.
+                        dm=mesh.simplify_quadric_decimation(face_count=RENDER_CAP)
                         nv,nf=np.asarray(dm.vertices,dtype=float),np.asarray(dm.faces)
                     else:
                         import fast_simplification as _fs
