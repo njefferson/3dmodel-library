@@ -485,6 +485,45 @@ class TestRendering(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIsNone(note, "fell back to striding despite a working decimator")
 
+    def make_kit(self, folder, placements, radius=0.5):
+        """placements: (x, y, z, scale) per part, in one shared coordinate system."""
+        import trimesh
+        d = os.path.join(self.tmp, folder); os.makedirs(d, exist_ok=True)
+        paths = []
+        for i, (x, y, z, sc) in enumerate(placements):
+            m = trimesh.creation.icosphere(subdivisions=2, radius=radius * sc)
+            m.apply_translation([x, y, z])
+            p = os.path.join(d, f"part{i}.stl"); m.export(p); paths.append(p)
+        return paths
+
+    def test_a_kit_laid_out_on_a_print_plate_draws_its_largest_part(self):
+        """Parts authored where they sit on the bed are metres apart in model space.
+        Concatenating them draws scattered specks, not the model."""
+        plate = self.make_kit("plate", [(i % 3 * 4.0, i // 3 * 4.0, 0, 1 if i == 0 else 0.3)
+                                        for i in range(9)])
+        ok, note = uc._render(plate, os.path.join(self.tmp, "plate.webp"))
+        self.assertTrue(ok)
+        self.assertIn("laid out apart", note or "")
+
+    def test_a_kit_that_actually_assembles_is_drawn_whole(self):
+        asm = self.make_kit("asm", [(0, 0, 0, 1.0), (0, 0, 0.55, 0.45), (0, 0, -0.5, 0.9)])
+        ok, note = uc._render(asm, os.path.join(self.tmp, "asm.webp"))
+        self.assertTrue(ok)
+        self.assertIsNone(note, "split a kit that fits together")
+
+    def test_two_part_kits_are_never_split_up(self):
+        pair = self.make_kit("pair", [(0, 0, 0, 1.0), (30.0, 0, 0, 0.9)])
+        ok, note = uc._render(pair, os.path.join(self.tmp, "pair.webp"))
+        self.assertTrue(ok)
+        self.assertIsNone(note, "dropped half of a two-part kit")
+
+    def test_the_spread_limit_is_configurable(self):
+        self.assertEqual(uc._spread_limit(), uc.SPREAD_LIMIT)
+        with mock.patch.object(uc, "rules", lambda: {"render_spread_limit": 9.9}):
+            self.assertEqual(uc._spread_limit(), 9.9)
+        with mock.patch.object(uc, "rules", lambda: {"render_spread_limit": "nonsense"}):
+            self.assertEqual(uc._spread_limit(), uc.SPREAD_LIMIT)
+
     def test_each_style_actually_changes_the_picture(self):
         shots = {}
         for name in ("slate", "paper", "bronze"):

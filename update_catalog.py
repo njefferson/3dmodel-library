@@ -375,9 +375,28 @@ def _render(model_paths, out_path, timeout=0):
         if not meshes:
             _alarm(0)
             return (False, load_err or f"no loadable geometry in {len(model_paths)} file(s)")
+        notes=[]
+        # Most downloaded kits are laid out on a print plate: every part authored
+        # where it sits on the bed, nowhere near the others. Concatenating those
+        # draws scattered debris rather than the model — on a real library a 316 MB
+        # nine-part kit came out as a handful of specks. When the whole envelope is
+        # far larger than its biggest piece, the parts are laid out rather than
+        # assembled, so draw the biggest piece instead of the scatter.
+        if len(meshes)>=3:
+            spans=[]
+            for m in meshes:
+                b=np.asarray(m.bounds,dtype=float)
+                spans.append((float(np.linalg.norm(b[1]-b[0])), b, m))
+            lo=np.min([b[0] for _d,b,_m in spans],axis=0)
+            hi=np.max([b[1] for _d,b,_m in spans],axis=0)
+            widest=max(d for d,_b,_m in spans)
+            spread=float(np.linalg.norm(hi-lo))/max(widest,1e-9)
+            if spread>_spread_limit():
+                notes.append(f"{len(meshes)} parts laid out apart ({spread:.1f}x "
+                             "the largest); drew the largest")
+                meshes=[max(spans,key=lambda s:s[0])[2]]
         mesh=trimesh.util.concatenate(meshes) if len(meshes)>1 else meshes[0]
         v=np.asarray(mesh.vertices,dtype=float); f=np.asarray(mesh.faces)
-        note=None
         # RENDER_CAP was 16,000, which was costing far more than it saved: measured
         # on a 114k-face mesh, matplotlib draws the lot in 0.66s against 0.16s for
         # 16k — under a second, on a job where loading the STL takes several. The
@@ -410,8 +429,8 @@ def _render(model_paths, out_path, timeout=0):
             # inside memory, and it says so.
             if not reduced and len(f)>HARD_CAP:
                 step=int(np.ceil(len(f)/HARD_CAP)); f=f[::step]
-                note=("too big to reduce without fast-simplification; drawn from every "
-                      f"{step}th triangle — run: pip install fast-simplification")
+                notes.append("too big to reduce without fast-simplification; drawn from "
+                             f"every {step}th triangle — run: pip install fast-simplification")
         # tight, robust framing: center on the bulk's bounding box, fill the frame,
         # and match the box aspect so thin/elongated parts don't render as a speck.
         lo=np.percentile(v,1,axis=0); hi=np.percentile(v,99,axis=0)
@@ -475,7 +494,7 @@ def _render(model_paths, out_path, timeout=0):
         bg=st["background_hex"]
         fig.patch.set_facecolor(bg); ax.set_facecolor(bg); fig.subplots_adjust(0,0,1,1)
         buf=io.BytesIO(); fig.savefig(buf,format="png",facecolor=bg); plt.close(fig); buf.seek(0)
-        _save_webp(Image.open(buf), out_path); _alarm(0); return (True,note)
+        _save_webp(Image.open(buf), out_path); _alarm(0); return (True,"; ".join(notes) or None)
     except TO:
         _alarm(0); return (False,"timeout")
     except MemoryError:
@@ -508,6 +527,15 @@ def _save_webp(im, out_path, edge=512, ceiling=200000):
 # looks. Between the two we simply draw everything.
 RENDER_CAP=120000
 HARD_CAP=250000
+# If a kit's whole envelope is more than this many times its largest single part,
+# the parts are laid out on a print plate rather than assembled together.
+# Measured on three layouts: 3.3x for a nine-part plate, 1.3x and 1.6x for kits
+# that genuinely fit together. Override with "render_spread_limit" in rules.json.
+SPREAD_LIMIT=2.5
+
+def _spread_limit():
+    try: return float(rules().get("render_spread_limit", SPREAD_LIMIT))
+    except (TypeError,ValueError): return SPREAD_LIMIT
 
 PREVIEW_HINT=re.compile(r"render|preview|thumb|_prev|display|promo|cover|hero|showcase",re.I)
 

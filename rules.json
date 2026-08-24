@@ -7,6 +7,8 @@
     "supported", "presupported", "pre-supported", "pre supported",
     "unsupported", "nosupports", "no supports", "supports", "support",
     "3mf", "lys", "chitubox", "lychee", "print", "prints", "printing",
+    "images", "image", "img", "renders", "render", "photos", "pics", "preview",
+    "previews", "docs", "instructions", "readme", "extras",
     "to print", "for printing", "split", "cut", "assembled", "whole",
     "bodies", "body", "misc", "new folder", "untitled", "resin", "fdm"
   ],

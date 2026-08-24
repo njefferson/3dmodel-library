@@ -141,6 +141,8 @@ top of the page. Nothing is skipped silently.
 
 Surfaces are shaded from averaged vertex normals rather than per-face ones, so a curved model reads as curved instead of as a bag of flat plates. (matplotlib paints each polygon a single colour and cannot interpolate across one, so the shading *field* is what has to vary — true Gouraud shading is not available here at any face count.) Winding is made consistent first, because downloaded STLs are full of reversed faces and two opposite normals meeting at a vertex cancel out.
 
+**Multi-part kits.** Most downloaded kits are laid out on a print plate — every part authored where it sits on the bed, nowhere near the others. Drawing all of them together gives a picture of scattered specks rather than of the model. When a kit's whole envelope is more than 2.5x its largest single part, the parts are taken to be laid out rather than assembled and the largest part is drawn on its own, with the reason recorded. Kits that genuinely fit together are drawn whole. Change the threshold with `"render_spread_limit"` in `rules.json`.
+
 Six colour schemes ship: `slate` (default), `paper`, `blueprint`, `bronze`, `mono`, `resin`. Try one before committing to a full re-render:
 
 ```bash
