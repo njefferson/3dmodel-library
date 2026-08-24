@@ -19,6 +19,7 @@ echo     3   Status: what's downloaded, is everything working
 echo     4   Show which folders get scanned
 echo     5   Test thumbnails on 6 small models
 echo    14   Show what the keyword rules did not recognise
+echo    15   Find kits you have more than one copy of
 echo.
 echo   PICTURES
 echo     6   Make thumbnails for items that have none
@@ -56,6 +57,7 @@ if "%c%"=="11" goto relocate
 if "%c%"=="12" goto prune
 if "%c%"=="13" goto reclass
 if "%c%"=="14" goto unmatched
+if "%c%"=="15" goto dupes
 if /i "%c%"=="R" goto refresh
 if /i "%c%"=="B" goto backup
 if /i "%c%"=="U" goto restore
@@ -83,6 +85,16 @@ if /i not "%y%"=="Y" goto menu
 cls & echo.
 python update_catalog.py --restore-backup
 python update_catalog.py --rebuild-views
+goto pause
+
+:dupes
+cls & echo.
+echo   Finds kits catalogued more than once and writes the full list to
+echo   potential_duplicates.csv. It DELETES NOTHING and never touches your
+echo   model folders - deciding what to remove is yours to do in Explorer.
+echo.
+python update_catalog.py --duplicates 20
+if exist "potential_duplicates.csv" echo   Spreadsheet:  potential_duplicates.csv
 goto pause
 
 :unmatched
@@ -241,6 +253,9 @@ echo.
 echo   11 The catalog stores where files were. If you reorganise, this
 echo      matches moved folders by their contents and updates them,
 echo      keeping the same thumbnail so nothing is re-rendered.
+echo.
+echo   15 Lists kits whose contents are identical - the same model
+echo      downloaded twice. Reports only; nothing is ever deleted.
 echo.
 echo   14 Shows what the rules did not recognise, and the filenames
 echo      inside those folders - the raw material for writing patterns.

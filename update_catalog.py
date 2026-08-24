@@ -343,11 +343,53 @@ def _alarm(n):
     the parent process enforces a deadline of its own — see _render_pool()."""
     if _HAS_ALARM:
         signal.alarm(max(0,int(n)))
+def _salvage_binary_stl(np, trimesh, data):
+    """Some STLs trimesh will not parse but which are perfectly good binary STL:
+    84-byte header then 50 bytes a triangle. Read them by hand."""
+    body=data[84:]; nt=len(body)//50
+    if nt<=0: return None
+    a=np.frombuffer(body[:nt*50],dtype=np.uint8).reshape(nt,50)
+    v=a[:,12:48].copy().view("<f4").reshape(-1,3)
+    return trimesh.Trimesh(vertices=v,faces=np.arange(nt*3).reshape(nt,3),process=False)
+
+def _load_meshes(sources):
+    """sources: file paths, or (bytes, extension) pairs for geometry already in
+    memory — a model inside a zip goes down exactly the same path as one on disk.
+    Returns (meshes, first_error)."""
+    import numpy as np, trimesh
+    meshes=[]; err=None
+    for src in sources:
+        blob=ext=None; label=None
+        if isinstance(src,tuple): blob,ext=src; label=f"<{ext} in archive>"
+        else: label=os.path.basename(src)
+        try:
+            if blob is None:
+                m=trimesh.load(src, force="mesh")
+            else:
+                m=trimesh.load(io.BytesIO(blob), file_type=ext.lstrip("."), force="mesh")
+            if isinstance(m,trimesh.Scene): m=m.dump(concatenate=True)
+            if not (hasattr(m,"faces") and len(m.faces)>0):
+                name=(src if blob is None else "x"+ext).lower()
+                if name.endswith(".stl"):
+                    if blob is None:
+                        with open(src,"rb") as fp: blob=fp.read()
+                    sal=_salvage_binary_stl(np, trimesh, blob)
+                    if sal is not None: m=sal
+            if hasattr(m,"faces") and len(m.faces)>0: meshes.append(m)
+        except Exception as e:
+            if err is None: err=f"{label}: {type(e).__name__}: {e}"[:160]
+            continue
+    return meshes, err
+
 def _render(model_paths, out_path, timeout=0):
-    """Render one thumbnail from a list of mesh files.
-    Returns (True, None) or (False, reason). The reason used to be discarded, which
-    is why a project that never got a picture gave no clue why - a missing library,
-    a corrupt mesh and an out-of-memory kill all looked identical from outside."""
+    """Render one thumbnail from mesh files on disk. See _draw for the rest."""
+    return _render_sources(list(model_paths), out_path, timeout=timeout,
+                           count=len(model_paths))
+
+def _render_sources(sources, out_path, timeout=0, count=None):
+    """Returns (True, note_or_None) or (False, reason). The reason used to be
+    discarded, which is why a project that never got a picture gave no clue why —
+    a missing library, a corrupt mesh and an out-of-memory kill looked identical."""
     try:
         try:
             import numpy as np, matplotlib; matplotlib.use("Agg")
@@ -357,24 +399,10 @@ def _render(model_paths, out_path, timeout=0):
         except ImportError as e:
             return (False, "render library missing: "+(getattr(e,"name",None) or str(e)))
         _alarm(timeout)
-        meshes=[]; load_err=None
-        for mp in model_paths:
-            try:
-                m=trimesh.load(mp, force="mesh")
-                if isinstance(m,trimesh.Scene): m=m.dump(concatenate=True)
-                if not (hasattr(m,"faces") and len(m.faces)>0) and mp.lower().endswith(".stl"):
-                    d=open(mp,"rb").read(); body=d[84:]; nt=len(body)//50
-                    if nt>0:
-                        a=np.frombuffer(body[:nt*50],dtype=np.uint8).reshape(nt,50)
-                        v=a[:,12:48].copy().view("<f4").reshape(-1,3)
-                        m=trimesh.Trimesh(vertices=v,faces=np.arange(nt*3).reshape(nt,3),process=False)
-                if hasattr(m,"faces") and len(m.faces)>0: meshes.append(m)
-            except Exception as e:
-                if load_err is None: load_err=f"{os.path.basename(mp)}: {type(e).__name__}: {e}"[:160]
-                continue
+        meshes,load_err=_load_meshes(sources)
         if not meshes:
             _alarm(0)
-            return (False, load_err or f"no loadable geometry in {len(model_paths)} file(s)")
+            return (False, load_err or f"no loadable geometry in {count or len(sources)} file(s)")
         notes=[]
         # Most downloaded kits are laid out on a print plate: every part authored
         # where it sits on the bed, nowhere near the others. Concatenating those
@@ -763,6 +791,89 @@ def _shell_thumb(src_path, out_path, size=512, bg=None):
     except Exception:
         return False
 
+# Reading an archive is the one place this tool touches an archive's bytes, so
+# callers MUST check _hydrated() first or a cloud placeholder gets pulled down.
+# Nothing is ever extracted to disk: single members are read into memory, under
+# these caps, and the archive is opened read-only.
+ZIP_IMAGE_CAP=40*1024*1024
+ZIP_MODEL_CAP=96*1024*1024
+
+def _zip_member(zf, zi, cap):
+    """One member's bytes, or None if it is (or claims to be) over the cap."""
+    if zi.file_size>cap: return None
+    with zf.open(zi) as fp:
+        data=fp.read(cap+1)          # read past the cap so a lying header is caught
+    return None if len(data)>cap else data
+
+def _zip_contents(zf):
+    """(model members, image members) from the central directory, junk excluded."""
+    models=[]; images=[]
+    for zi in zf.infolist():
+        name=zi.filename
+        if name.endswith("/") or getattr(zi,"is_dir",lambda: False)(): continue
+        if "__MACOSX" in name: continue
+        base=name.replace("\\","/").rsplit("/",1)[-1]
+        if not base or base.startswith("._"): continue
+        ext=os.path.splitext(base)[1].lower()
+        if ext in MODEL: models.append(zi)
+        elif ext in IMG: images.append(zi)
+    return models, images
+
+def _zip_thumb(src, out_path):
+    """Look inside a .zip for something to show. Returns (status, detail, extra),
+    where extra is catalog fields learned from the archive's contents.
+    Archives were indexed by filename alone, so every one of them was a blank card
+    saying "packed .zip" — and the catalog could not say how many parts were in it
+    or what formats it held."""
+    import zipfile
+    ext=os.path.splitext(src)[1].lower()
+    if ext!=".zip":
+        return ("unsupported", f"{ext} archives are indexed by name only", None)
+    try:
+        with zipfile.ZipFile(src) as zf:
+            models,images=_zip_contents(zf)
+            extra={"part_count":len(models) or None,
+                   "inner_bytes":sum(zi.file_size for zi in models),
+                   "model_files":[zi.filename.replace("\\","/").rsplit("/",1)[-1]
+                                  for zi in sorted(models,key=lambda z:-z.file_size)[:200]],
+                   "formats":sorted({os.path.splitext(zi.filename)[1].lstrip(".").lower()
+                                     for zi in models} | {"zip"})}
+            hinted=[zi for zi in images
+                    if PREVIEW_HINT.search(zi.filename.rsplit("/",1)[-1])] or images
+            for zi in sorted(hinted,key=lambda z:-z.file_size):
+                data=_zip_member(zf,zi,ZIP_IMAGE_CAP)
+                if data is None: continue
+                try:
+                    from PIL import Image
+                    im=Image.open(io.BytesIO(data)); im.load()
+                    _save_webp(im,out_path)
+                    return ("reused",
+                            "preview image from inside the zip "
+                            f"({zi.filename.rsplit('/',1)[-1]})", extra)
+                except Exception:
+                    continue
+            for zi in sorted(models,key=lambda z:-z.file_size):
+                if zi.file_size>ZIP_MODEL_CAP:
+                    return ("packed", f"largest model inside is {zi.file_size/1e6:.0f} MB — "
+                                      "too big to render without extracting", extra)
+                data=_zip_member(zf,zi,ZIP_MODEL_CAP)
+                if data is None: continue
+                mext=os.path.splitext(zi.filename)[1].lower()
+                ok,why=_render_sources([(data,mext)], out_path, timeout=_TIMEOUT, count=1)
+                if ok:
+                    return ("mesh", f"rendered from {zi.filename.rsplit('/',1)[-1]} "
+                                    "inside the zip", extra)
+                return ("packed", why, extra)
+            return ("packed", "no preview image or model file inside", extra)
+    except zipfile.BadZipFile:
+        return ("packed", "not a readable zip", None)
+    except RuntimeError as e:
+        return ("packed", f"{e}"[:120], None)          # encrypted archives land here
+    except MemoryError:
+        return ("packed", "not enough memory to read this archive", None)
+    except Exception as e:
+        return ("packed", f"{type(e).__name__}: {e}"[:120], None)
+
 # Catalogued, but nothing bundled here can turn CAD into a picture.
 UNRENDERABLE={".step",".stp"}
 # Every value thumb_status can hold. OK_STATUS means a picture exists.
@@ -778,27 +889,34 @@ STATUS_LABEL={
 
 def _thumb_for(it, out_path, engine="shell"):
     """Produce one thumbnail: reuse shipped preview, else shell handler, else mesh render.
-    Returns (status, detail). Every outcome names itself — the old version returned
-    the bare string "pending" for a file still in the cloud, a missing render
-    library, a corrupt mesh and an out-of-memory kill alike."""
+    Returns (status, detail, extra) — extra being catalog fields learned along the
+    way, which only archives currently produce. Every outcome names itself; the old
+    version returned the bare string "pending" for a file still in the cloud, a
+    missing render library, a corrupt mesh and an out-of-memory kill alike."""
+    if it.get("type")=="archive":
+        st=_hydrated(it.get("path",""))
+        if st is False: return ("cloud_only","the archive is online-only",None)
+        if st is None:  return ("missing","the archive is not at the recorded path",None)
+        return _zip_thumb(it["path"], out_path)
     prev=it.get("preview_file")
     if it.get("has_shipped_preview") and prev and _hydrated(prev) is True:
         ok,_why=_reuse(prev, out_path)
-        if ok: return ("reused",None)      # a bad preview file just falls through to the mesh
-    if not (it.get("model_files") or []): return ("no_model_file",None)
+        if ok: return ("reused",None,None) # a bad preview file just falls through to the mesh
+    if not (it.get("model_files") or []): return ("no_model_file",None,None)
     hyd,cloud,gone=_hydrated_parts(it)
     if not hyd:
-        if cloud: return ("cloud_only", f"{cloud} part(s) still online-only")
-        return ("missing", f"{gone} file(s) not found under {it.get('path','')}")
+        if cloud: return ("cloud_only", f"{cloud} part(s) still online-only", None)
+        return ("missing", f"{gone} file(s) not found under {it.get('path','')}", None)
     renderable=[p for p in hyd if os.path.splitext(p)[1].lower() not in UNRENDERABLE]
     if not renderable:
-        return ("unsupported", "only "+", ".join(sorted({os.path.splitext(p)[1].lower() for p in hyd})))
+        return ("unsupported",
+                "only "+", ".join(sorted({os.path.splitext(p)[1].lower() for p in hyd})), None)
     best=None; bestsz=-1
     for p in renderable:               # largest hydrated part = most representative
         try: sz=os.path.getsize(p)
         except OSError: continue
         if sz>bestsz: bestsz=sz; best=p
-    if engine!="mesh" and best and _shell_thumb(best, out_path): return ("shell",None)
+    if engine!="mesh" and best and _shell_thumb(best, out_path): return ("shell",None,None)
     ok,why=_render(renderable, out_path, timeout=_TIMEOUT)
     if ok:
         # rendered — but say so if it is only part of the kit, or was reduced crudely
@@ -806,8 +924,8 @@ def _thumb_for(it, out_path, engine="shell"):
         if cloud or gone:
             bits.append(f"rendered from {len(renderable)} of {len(renderable)+cloud+gone} part(s)")
         if why: bits.append(why)
-        return ("mesh", "; ".join(bits) or None)
-    return ("timeout" if why=="timeout" else "failed", why)
+        return ("mesh", "; ".join(bits) or None, None)
+    return ("timeout" if why=="timeout" else "failed", why, None)
 
 _ENGINE="shell"
 _TIMEOUT=0.0            # seconds a single render may take; 0 = no limit
@@ -818,14 +936,19 @@ def _init_worker(engine, timeout=0.0, style=None):
 def render_one(it):
     """Pool worker. Uses the module-global engine (set via pool initializer). Never raises."""
     try:
-        st,detail=_thumb_for(it, os.path.join(THUMBS, it["id"]+".webp"), _ENGINE)
-        return (it["id"], st, detail)
+        st,detail,extra=_thumb_for(it, os.path.join(THUMBS, it["id"]+".webp"), _ENGINE)
+        return (it["id"], st, detail, extra)
     except Exception as e:
-        return (it["id"], "failed", f"{type(e).__name__}: {e}"[:160])
+        return (it["id"], "failed", f"{type(e).__name__}: {e}"[:160], None)
 
 def _skip_status(it):
-    """Why this project cannot be rendered right now, or (None, None) if it can.
+    """Why this item cannot be rendered right now, or (None, None) if it can.
     Attribute reads only — nothing is opened, so nothing is pulled out of the cloud."""
+    if it.get("type")=="archive":
+        st=_hydrated(it.get("path",""))
+        if st is True: return (None,None)
+        if st is False: return ("cloud_only","the archive is online-only")
+        return ("missing","the archive is not at the recorded path")
     if not (it.get("model_files") or []): return ("no_model_file",None)
     hyd,cloud,gone=_hydrated_parts(it)
     if hyd: return (None,None)
@@ -839,10 +962,12 @@ def _mesh_libs_missing():
         except Exception: return mod
     return None
 
+RENDERABLE_TYPES=("project","archive")
+
 def status_counts(items):
     from collections import Counter
     return Counter((it.get("thumb_status") or "pending")
-                   for it in items if it.get("type")=="project")
+                   for it in items if it.get("type") in RENDERABLE_TYPES)
 
 def print_status_summary(items, prefix="  ", examples=3):
     """What happened to every project, and for anything without a picture, why.
@@ -850,9 +975,9 @@ def print_status_summary(items, prefix="  ", examples=3):
     nobody had got to yet: both said 'pending' and neither said anything at all."""
     c=status_counts(items); ex={}
     for it in items:
-        if it.get("type")!="project": continue
+        if it.get("type") not in RENDERABLE_TYPES: continue
         st=it.get("thumb_status") or "pending"
-        if st in OK_STATUS or st=="packed": continue
+        if st in OK_STATUS: continue
         ex.setdefault(st,[])
         if len(ex[st])<examples: ex[st].append((it.get("path",""), it.get("thumb_error") or ""))
     order=[k for k in ("reused","shell","mesh","existing") if c.get(k)]+ \
@@ -1007,11 +1132,12 @@ def _render_pool(targets, jobs, engine, timeout, on_done, on_progress=None, pool
                 it,started=inflight[ar]
                 if ar.ready():
                     del inflight[ar]
-                    try: pid,status,detail=ar.get(0)
+                    try: pid,status,detail,extra=ar.get(0)
                     except Exception as e:
-                        pid,status,detail=it["id"],"failed",f"{type(e).__name__}: {e}"[:160]
+                        pid,status,detail,extra=(it["id"],"failed",
+                                                 f"{type(e).__name__}: {e}"[:160],None)
                     finished+=1; moved=True
-                    on_done(pid,status,detail)
+                    on_done(pid,status,detail,extra)
                     if on_progress: on_progress(finished)
                 elif timeout and time.time()-started>timeout:
                     waited=time.time()-started
@@ -1022,7 +1148,7 @@ def _render_pool(targets, jobs, engine, timeout, on_done, on_progress=None, pool
                     inflight.clear()
                     finished+=1; timed_out+=1; restarted+=len(others); moved=True
                     on_done(it["id"],"timeout",
-                            f"no result after {_dur(waited)}; the worker was killed")
+                            f"no result after {_dur(waited)}; the worker was killed", None)
                     note=(f" {len(others)} other render(s) in progress were restarted."
                           if others else "")
                     print(f"  [!] gave up on {_short(it.get('path',''),2)} after "
@@ -1043,10 +1169,10 @@ def render_missing(items, checkpoint=None, force=False, jobs=1, engine="shell", 
     _ensure_dirs()
     global _ENGINE,_TIMEOUT          # used by the in-process path (render_one reads them)
     _ENGINE=engine; _TIMEOUT=max(5.0,timeout*0.9) if timeout else 0.0
-    idmap={it["id"]:it for it in items if it.get("type")=="project"}
+    idmap={it["id"]:it for it in items if it.get("type") in ("project","archive")}
     targets=[]; pending_total=0
     for it in items:
-        if it.get("type")!="project": continue
+        if it.get("type") not in ("project","archive"): continue
         if not force and os.path.exists(os.path.join(THUMBS,it["id"]+".webp")):
             it["thumbnail"]=it["id"]+".webp"
             if it.get("thumb_status") not in OK_STATUS: it["thumb_status"]="existing"
@@ -1077,7 +1203,7 @@ def render_missing(items, checkpoint=None, force=False, jobs=1, engine="shell", 
     if deferred:
         print(f"  deferring {len(deferred)} huge project(s) over {max_mb:.0f} MB "
               f"(run with --max-mb 99999 to include them).", flush=True)
-    print(f"  {pending_total} projects need a thumbnail; {total} downloaded & renderable now, "
+    print(f"  {pending_total} item(s) need a thumbnail; {total} downloaded & renderable now, "
           f"{cloud} not renderable yet{' (FORCE re-render)' if force else ''}.", flush=True)
     print(f"  Rendering with {jobs} core(s), engine='{engine}', "
           f"{('giving up on any one model after '+_dur(timeout)) if timeout else 'no time limit per model'}.",
@@ -1092,7 +1218,7 @@ def render_missing(items, checkpoint=None, force=False, jobs=1, engine="shell", 
         print(f"  {len(seen)}/{total} done ({done} ok, {failed} failed) · "
               f"{_dur(time.time()-t0)} elapsed{eta.summary()}{stalled}", flush=True)
     ticker=_Ticker(report)
-    def apply(pid,status,detail=None):
+    def apply(pid,status,detail=None,extra=None):
         nonlocal done,failed
         it=idmap.get(pid)
         if it is None: return
@@ -1101,6 +1227,8 @@ def render_missing(items, checkpoint=None, force=False, jobs=1, engine="shell", 
             it["thumb_status"]=status
             if detail: it["thumb_error"]=detail
             else: it.pop("thumb_error",None)
+            for k,v in (extra or {}).items():   # what looking inside the zip taught us
+                if v not in (None,[],""): it[k]=v
             if status in OK_STATUS: it["thumbnail"]=pid+".webp"; done+=1
             else: failed+=1
     def _ck(k):
@@ -1123,7 +1251,8 @@ def render_missing(items, checkpoint=None, force=False, jobs=1, engine="shell", 
                           "Windows.\n      A stuck model will stall the run; Ctrl+C and lower "
                           "--max-mb if that happens.", flush=True)
                 for it in [i for i in targets if i["id"] not in seen]:
-                    pid,status,detail=render_one(it); apply(pid,status,detail); _ck(len(seen))
+                    pid,status,detail,extra=render_one(it)
+                    apply(pid,status,detail,extra); _ck(len(seen))
     finally:
         ticker.stop()
     if total: ticker.emit()
@@ -1340,6 +1469,85 @@ def reclassify(by_id, dry_run=False):
         if not dry_run:
             it["category"]=cat; it["faction"]=fac; it["source"]=src; it["tags"]=newtags
     return changed
+
+DUPES_CSV=os.path.join(LIB,"potential_duplicates.csv")
+
+def _loose_fingerprint(it):
+    """Same model filenames and count, ignoring size — catches the same kit
+    re-downloaded or re-exported at a different quality."""
+    names=sorted((n or "").strip().lower() for n in (it.get("model_files") or []))
+    if not names: return None
+    return hashlib.md5(("|".join(names)+f"::{len(names)}").encode("utf-8","ignore")).hexdigest()[:16]
+
+def find_duplicates(by_id):
+    """Kits whose contents match: same model filenames, same count, same total size.
+    This reuses the fingerprint the move-detector already computes, so it costs one
+    pass over the catalog — no folder is walked and no file is opened.
+    Returns (exact, near) as lists of (wasted_bytes, [items]), biggest waste first."""
+    exact={}; loose={}
+    for it in by_id.values():
+        if it.get("type")!="project": continue
+        fp=_fingerprint(it)
+        if fp: exact.setdefault(fp,[]).append(it)
+        lf=_loose_fingerprint(it)
+        if lf: loose.setdefault(lf,[]).append(it)
+    def rank(groups):
+        out=[]
+        for g in groups.values():
+            if len(g)<2: continue
+            g=sorted(g, key=lambda i: (i.get("path") or "").lower())
+            # keeping one copy, the rest is what you would get back
+            out.append((sum(i.get("size_bytes",0) for i in g[1:]), g))
+        out.sort(key=lambda t: -t[0])
+        return out
+    ex=rank(exact)
+    covered={i["id"] for _w,g in ex for i in g}
+    near=[(w,g) for w,g in rank(loose) if not all(i["id"] in covered for i in g)]
+    return ex, near
+
+def show_duplicates(by_id, limit=20):
+    """Report duplicate kits and write potential_duplicates.csv. Reports only —
+    nothing is deleted and nothing in your model folders is touched, ever."""
+    ex,near=find_duplicates(by_id)
+    if not ex and not near:
+        print("\nNo duplicate kits found."); return
+    waste=sum(w for w,_g in ex)
+    copies=sum(len(g)-1 for _w,g in ex)
+    print(f"\n{len(ex):,} kit(s) are catalogued more than once — {copies:,} extra "
+          f"cop(ies), {waste/1e9:.2f} GB you would get back by keeping one of each.")
+    for i,(w,g) in enumerate(ex[:limit],1):
+        dn,_c,_bc=_display_fields(g[0].get("path",""))
+        mb=(g[0].get("size_bytes") or 0)/1e6
+        print(f"\n  {i}. {dn}  —  {len(g)} copies, {mb:,.0f} MB each "
+              f"({g[0].get('part_count') or '?'} parts)")
+        for it in g: print(f"       {it.get('path','')}")
+    if len(ex)>limit:
+        print(f"\n  ...and {len(ex)-limit:,} more. The full list is in the CSV below.")
+    if near:
+        nw=sum(w for w,_g in near)
+        print(f"\n{len(near):,} more group(s) have the SAME FILENAMES but different "
+              f"sizes — the same kit re-exported or re-downloaded ({nw/1e9:.2f} GB).")
+        for w,g in near[:5]:
+            dn,_c,_bc=_display_fields(g[0].get("path",""))
+            print(f"\n  {dn}  —  {len(g)} versions")
+            for it in g:
+                print(f"       {(it.get('size_bytes') or 0)/1e6:>8,.0f} MB   {it.get('path','')}")
+    rows=[]
+    for kind,groups in (("exact",ex),("same-names",near)):
+        for gi,(w,g) in enumerate(groups,1):
+            for it in g:
+                dn,col,_bc=_display_fields(it.get("path",""))
+                rows.append([kind,f"{kind}-{gi}",dn,col,len(g),
+                             round((it.get("size_bytes") or 0)/1e6,1),
+                             it.get("part_count") or "", it.get("path","")])
+    buf=io.StringIO(); w_=csv.writer(buf)
+    w_.writerow(["match","group","name","collection","copies","size_mb","parts","path"])
+    w_.writerows(rows)
+    atomic_write(DUPES_CSV, buf.getvalue())
+    print(f"\nFull list: {DUPES_CSV}")
+    print("  That file contains absolute paths — it is gitignored, keep it that way.")
+    print("  Nothing was deleted. This only ever reads the catalog; deciding which")
+    print("  copy to keep, and removing it, is yours to do in Explorer.")
 
 def show_unmatched(by_id, n=25):
     """What the rules did not recognise: entries sitting in the default category with
@@ -1598,7 +1806,7 @@ function render(){
    const colTxt=(d.col&&d.col!=="(none)"&&d.col.toLowerCase()!==d.n.toLowerCase())?d.col:"";
    const crumbTxt=[colTxt,d.bc].filter(Boolean).join(" › ");
    const crumb=crumbTxt?`<div class="crumb" title="${esc(d.path)}">${esc(crumbTxt)}</div>`:"";
-   c.innerHTML=`<div class="thumb">${thumb}<span class="badge">${d.p?'zip':d.pc+'p'}</span></div>
+   c.innerHTML=`<div class="thumb">${thumb}<span class="badge">${d.p?(d.pc?'zip · '+d.pc+'p':'zip'):d.pc+'p'}</span></div>
    <div class="body"><div class="nm" title="${esc(d.path)}">${esc(d.n)}</div>${crumb}
    <div class="meta"><span class="tag">${esc(d.c)}</span>${fac}<span class="tag">${esc(d.s)}</span>${types}<span class="tag">${d.mb}MB</span></div>
    <div class="find">
@@ -1635,8 +1843,8 @@ function openLB(d){
  $("#lbpath").textContent=d.path;
  const rows=[["Folder",d.col&&d.col!=="(none)"?d.col:"—"],["Location",d.bc||"—"],
    ["Category",d.c],["Faction",d.f||"—"],["Source",d.s],
-   ["Kind",d.p?"packed .zip (not extracted)":"extracted files"],
-   ["Parts",d.p?"—":d.pc],["Size",d.mb+" MB"],["Main file",d.pf||"—"],
+   ["Kind",d.p?"packed .zip (nothing extracted)":"extracted files"],
+   ["Parts",d.pc||"—"],["Size",d.mb+" MB"],["Main file",d.pf||"—"],
    ["Picture",tsText(d)+(d.te?" — "+d.te:"")],
    ["Labels",(d.tags||[]).map(t=>t.replace("type:","")).join(", ")||"—"]];
  $("#lbtab").innerHTML=rows.map(r=>`<tr><td>${esc(r[0])}</td><td>${esc(r[1])}</td></tr>`).join("");
@@ -1797,7 +2005,7 @@ def sample_render(items, n, engine="shell"):
         dn,_col,_bc=_display_fields(it["path"])
         print(f"  [{i}/{len(picked)}] {dn}  ({it.get('part_count') or '?'} parts, {mb:.0f} MB)...", flush=True)
         ts=time.time()
-        status,detail=_thumb_for(it, newp, engine)
+        status,detail,_x=_thumb_for(it, newp, engine)
         dt=time.time()-ts; times.append(dt); avg=sum(times)/len(times); left=(len(picked)-i)*avg
         print(f"        {status} in {dt:.1f}s   (avg {avg:.1f}s/file, ~{left:.0f}s left)"
               f"{chr(10)+'        '+detail if detail else ''}", flush=True)
@@ -1908,6 +2116,7 @@ def main():
     ap.add_argument("--restore-backup",nargs="?",const="",default=None,metavar="FILE",help="put a backup from backups/ back in place as catalog.json (newest if no name given)")
     ap.add_argument("--backup",action="store_true",help="copy catalog.json into backups/ right now")
     ap.add_argument("--unmatched",nargs="?",type=int,const=25,default=0,metavar="N",help="list entries no rule matched, with the part names inside them, to help write patterns")
+    ap.add_argument("--duplicates",nargs="?",type=int,const=20,default=0,metavar="N",help="find kits catalogued more than once and write potential_duplicates.csv (reports only, deletes nothing)")
     a=ap.parse_args()
     _ensure_dirs()
     if a.style:
@@ -1927,6 +2136,8 @@ def main():
         show_sources(by_id); return
     if a.unmatched:
         show_unmatched(by_id, a.unmatched); return
+    if a.duplicates:
+        show_duplicates(by_id, a.duplicates); return
     if a.add_source:
         p=a.add_source.strip().rstrip("\\/")
         if not os.path.isdir(p):
@@ -2020,6 +2231,7 @@ Or use these directly:
   --reclassify               re-apply rules.json to everything already catalogued
   --reclassify --dry-run     ...show what that would change, and write nothing
   --unmatched 25             what the rules missed, and the filenames inside
+  --duplicates               kits you have more than one copy of (deletes nothing)
   --backup                   copy catalog.json into backups/ right now
   --restore-backup           put the newest backups/ copy back as catalog.json
   --sample 8                 preview 8 thumbnails into _render_test/

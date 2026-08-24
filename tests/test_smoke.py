@@ -329,7 +329,7 @@ class FakePool:
         if it["id"] in self.hang: return FakeResult(never=True)
         if it["id"] in self.slow and self.attempts[it["id"]] == 1:
             return FakeResult(never=True)
-        return FakeResult((it["id"], "mesh", None))
+        return FakeResult((it["id"], "mesh", None, None))
     def terminate(self): self.terminated = True
     def join(self): pass
 
@@ -352,7 +352,7 @@ class TestRenderTimeout(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             timed_out, restarted = uc._render_pool(
                 items, jobs, "mesh", timeout,
-                lambda pid, st, detail: seen.__setitem__(pid, (st, detail)),
+                lambda pid, st, detail, extra=None: seen.__setitem__(pid, (st, detail)),
                 pool_factory=factory)
         return seen, pools, timed_out, restarted, buf.getvalue()
 
@@ -614,7 +614,7 @@ class TestCloudSafety(LibraryCase):
         with mock.patch.object(uc, "_hydrated", lambda p: p not in cloudy), \
              mock.patch.object(uc, "_render", fake_render), \
              mock.patch.object(uc, "_shell_thumb", return_value=False):
-            status, detail = uc._thumb_for(titan, os.path.join(self.lib, "t.webp"), engine="mesh")
+            status, detail, _x = uc._thumb_for(titan, os.path.join(self.lib, "t.webp"), engine="mesh")
 
         self.assertEqual(status, "mesh")
         self.assertEqual(handed, [os.path.join(titan["path"], "body.stl")])
@@ -625,7 +625,7 @@ class TestCloudSafety(LibraryCase):
         titan = [p for p in self.projects() if "Warhound" in p["path"]][0]
         with mock.patch.object(uc, "_hydrated", lambda p: False), \
              mock.patch.object(uc, "_render", side_effect=AssertionError("must not render")):
-            status, detail = uc._thumb_for(titan, os.path.join(self.lib, "t.webp"), engine="mesh")
+            status, detail, _x = uc._thumb_for(titan, os.path.join(self.lib, "t.webp"), engine="mesh")
         self.assertEqual(status, "cloud_only")
         self.assertIn("3 part(s)", detail)
 
@@ -741,6 +741,128 @@ class TestReclassify(LibraryCase):
         self.scan()
         out = self.run_cli("--reclassify")
         self.assertIn("nothing to do", out)
+
+
+class TestPackedArchives(LibraryCase):
+    """Archives were indexed by filename alone, so every one was a blank card."""
+
+    def make_zip(self, name, members):
+        import zipfile
+        p = os.path.join(self.models, name)
+        with zipfile.ZipFile(p, "w") as zf:
+            for member, data in members.items(): zf.writestr(member, data)
+        return p
+
+    def stl_bytes(self, tris=4):
+        import io as _io
+        buf = os.path.join(self.tmp, "tmp.stl"); write_stl(buf, tris)
+        with open(buf, "rb") as fp: return fp.read()
+
+    def png_bytes(self, colour=(200, 40, 40)):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("needs pillow")
+        import io as _io
+        b = _io.BytesIO(); Image.new("RGB", (64, 64), colour).save(b, "PNG")
+        return b.getvalue()
+
+    def test_a_preview_image_inside_the_zip_becomes_the_card(self):
+        self.make_zip("Kit.zip", {"parts/body.stl": self.stl_bytes(),
+                                  "renders/preview.png": self.png_bytes()})
+        self.scan()
+        z = [i for i in self.catalog()["items"] if i["type"] == "archive"][0]
+        self.assertEqual(z["thumb_status"], "reused")
+        self.assertIn("inside the zip", z["thumb_error"])
+        self.assertTrue(os.path.exists(os.path.join(self.lib, "thumbnails", z["id"] + ".webp")))
+
+    def test_the_contents_are_recorded_even_without_a_picture(self):
+        self.make_zip("Bits.zip", {"a.stl": self.stl_bytes(), "b.stl": self.stl_bytes(6),
+                                   "c.obj": b"o x\n", "notes.txt": b"hi"})
+        self.scan()
+        z = [i for i in self.catalog()["items"] if i["type"] == "archive"][0]
+        self.assertEqual(z["part_count"], 3)
+        self.assertIn("stl", z["formats"])
+        self.assertIn("zip", z["formats"])
+        self.assertIn("a.stl", z["model_files"])
+        self.assertNotIn("notes.txt", z["model_files"])
+
+    def test_mac_junk_inside_a_zip_is_ignored(self):
+        self.make_zip("Mac.zip", {"real.stl": self.stl_bytes(),
+                                  "__MACOSX/._real.stl": b"junk",
+                                  "._sneaky.stl": b"junk"})
+        self.scan()
+        z = [i for i in self.catalog()["items"] if i["type"] == "archive"][0]
+        self.assertEqual(z["model_files"], ["real.stl"])
+        self.assertEqual(z["part_count"], 1)
+
+    def test_a_corrupt_archive_says_so_instead_of_crashing(self):
+        with open(os.path.join(self.models, "Broken.zip"), "wb") as fp:
+            fp.write(b"this is not a zip file at all")
+        self.scan()
+        z = [i for i in self.catalog()["items"] if i["type"] == "archive"][0]
+        self.assertEqual(z["thumb_status"], "packed")
+        self.assertIn("not a readable zip", z["thumb_error"])
+
+    def test_other_archive_formats_are_named_not_silently_skipped(self):
+        with open(os.path.join(self.models, "Old.rar"), "wb") as fp: fp.write(b"Rar!\x1a\x07\x00")
+        self.scan()
+        z = [i for i in self.catalog()["items"] if i["type"] == "archive"][0]
+        self.assertEqual(z["thumb_status"], "unsupported")
+        self.assertIn(".rar", z["thumb_error"])
+
+    def test_an_online_only_archive_is_never_opened(self):
+        self.make_zip("Cloud.zip", {"a.stl": self.stl_bytes()})
+        self.scan()
+        z = [i for i in self.catalog()["items"] if i["type"] == "archive"][0]
+        import zipfile
+        with mock.patch.object(uc, "_hydrated", lambda p: False), \
+             mock.patch.object(zipfile, "ZipFile", side_effect=AssertionError("opened it")):
+            st, detail, extra = uc._thumb_for(z, os.path.join(self.lib, "x.webp"))
+        self.assertEqual(st, "cloud_only")
+
+
+class TestDuplicates(LibraryCase):
+
+    def test_identical_kits_are_grouped_and_written_to_the_csv(self):
+        # three copies of one kit, the way Windows names a repeated download
+        for name in ("Tyrant Guard", "Tyrant Guard (1)", "Tyrant Guard (2)"):
+            self.add_kit(name, ["body.stl", "arm.stl"])
+        self.scan()
+        out = self.run_cli("--duplicates")
+        self.assertIn("3 copies", out)
+        self.assertIn("Nothing was deleted", out)
+        for name in ("Tyrant Guard", "Tyrant Guard (1)", "Tyrant Guard (2)"):
+            self.assertIn(name, out)
+        import csv as _csv
+        with open(os.path.join(self.lib, "potential_duplicates.csv"), encoding="utf-8") as fp:
+            rows = list(_csv.DictReader(fp))
+        self.assertEqual(len([r for r in rows if r["match"] == "exact"]), 3)
+        self.assertTrue(all(r["group"] == rows[0]["group"] for r in rows if r["match"] == "exact"))
+
+    def test_reporting_duplicates_removes_nothing(self):
+        for name in ("Kit A", "Kit A copy"):
+            self.add_kit(name, ["body.stl"])
+        self.scan()
+        before = len(self.projects())
+        self.run_cli("--duplicates")
+        self.assertEqual(len(self.projects()), before, "the report changed the catalog")
+        for name in ("Kit A", "Kit A copy"):
+            self.assertTrue(os.path.isdir(os.path.join(self.models, name)),
+                            "the report touched a source folder")
+
+    def test_the_same_kit_at_a_different_size_is_reported_separately(self):
+        self.add_kit("Bust", ["head.stl"])
+        d = os.path.join(self.models, "Bust hires"); os.makedirs(d)
+        write_stl(os.path.join(d, "head.stl"), tris=40)      # same name, bigger file
+        self.scan()
+        out = self.run_cli("--duplicates")
+        self.assertIn("SAME FILENAMES but different", out)
+
+    def test_distinct_kits_are_not_reported(self):
+        self.scan()
+        out = self.run_cli("--duplicates")
+        self.assertIn("No duplicate kits found", out)
 
 
 class TestRelocateAndPrune(LibraryCase):

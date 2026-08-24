@@ -60,7 +60,7 @@ On Windows you can skip the commands entirely — double-click **`LIBRARY.bat`**
 ```
 BROWSE           1  gallery          2  spreadsheet
 CHECK (safe)     3  status           4  scanned folders   5  test 6 thumbnails
-                14  what the rules missed
+                14  what the rules missed   15  find duplicates
 PICTURES         6  make missing     7  redo all
 FOLDERS/FILES    8  add folder       9  stop scanning    10  find new files
                 11  fix moved       12  remove dead entries
@@ -88,6 +88,7 @@ back.
 - `--reclassify` — re-apply `rules.json` to everything already catalogued
 - `--reclassify --dry-run` — show exactly what that would change, and write nothing
 - `--unmatched 25` — list what no rule recognised, with the part names inside, to help write patterns
+- `--duplicates` — find kits you hold more than one copy of, and write `potential_duplicates.csv`
 
 **Pictures**
 
@@ -120,6 +121,28 @@ back.
 **`shell`** (Windows only) asks Windows for the same thumbnail Explorer shows. Near-instant when it works — but it depends entirely on whether you have an STL thumbnail handler installed, and on some machines it fails for every file. The tool detects that and falls back to `mesh` automatically. It also rejects the case where Windows hands back the same generic icon for everything.
 
 Use `--compare-engines 6` to see which one your machine actually produces better results with.
+
+## Duplicates
+
+Kits get downloaded twice. Because every item already carries a fingerprint of its contents — the model filenames, how many, and the total size — finding the repeats costs one pass over the catalog, with no folder walked and no file opened:
+
+```bash
+python update_catalog.py --duplicates
+```
+
+It reports the biggest offenders, says how much space keeping one of each would give back, and writes the full list to `potential_duplicates.csv`. A second section lists kits with the *same filenames but different sizes* — the same model re-exported or re-downloaded at another quality.
+
+It **deletes nothing** and never touches a model folder. Deciding which copy to keep is yours to do in Explorer. Note that the CSV holds absolute paths; it is gitignored, and should stay that way.
+
+## Inside `.zip` archives
+
+Archives used to be indexed by filename alone, so every one was a blank card. Now, once an archive is downloaded (never while it is still a cloud placeholder), the tool reads its index and:
+
+- records how many model files are inside, and in what formats
+- uses an artist's preview image from inside the archive as the card, if there is one
+- otherwise renders the largest model inside it, if that model is under 96 MB
+
+Nothing is ever extracted to disk. Single members are read into memory under a size cap, the archive is opened read-only, and a corrupt or encrypted one is reported rather than skipped in silence.
 
 ## Why an item has no picture
 
@@ -208,7 +231,7 @@ The included `.gitignore` excludes all of it, plus `sources.txt` and `backups/`.
 
 - Killing a stuck render means killing the worker pool, so anything else being rendered at that moment is restarted from scratch. Rare, and the alternative was one bad model stalling the whole run.
 - `.step`/`.stp` files are catalogued but not thumbnailed — no CAD converter is bundled. They are reported as `unsupported` rather than left blank.
-- `.zip` archives are indexed by name only. Nothing is extracted.
+- `.rar` and `.7z` archives are indexed by name only — nothing here can read them.
 - Classification is keyword-based, so it is approximate. It reads the folder path first and the filenames inside as a fallback; it never opens a file to see what the model actually is. Edit `rules.json`, check with `--unmatched`, and apply with `--reclassify`.
 - `LIBRARY.bat` is Windows-only. Everything it does is available as a command elsewhere, and the Python script itself runs anywhere.
 
