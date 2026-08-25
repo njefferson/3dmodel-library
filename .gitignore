@@ -9,6 +9,7 @@ potential_duplicates.csv
 print-tracker-import.json
 sources.txt
 thumbnails/
+thumbnails.new/
 backups/
 _render_test/
 _engine_test/

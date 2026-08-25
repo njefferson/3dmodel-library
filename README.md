@@ -66,6 +66,7 @@ BROWSE           1  gallery          2  spreadsheet
 CHECK (safe)     3  status           4  scanned folders   5  test 6 thumbnails
                 14  what the rules missed   15  find duplicates
 PICTURES         6  make missing     7  redo all      16  change the look
+                17  redo all, swapped in at the end
 FOLDERS/FILES    8  add folder       9  stop scanning    10  find new files
                 11  fix moved       12  remove dead entries
                 13  re-apply rules
@@ -97,7 +98,8 @@ back.
 **Pictures**
 
 - `--thumbs-only` — make thumbnails only for items that lack one
-- `--thumbs-only --force` — rebuild every thumbnail
+- `--thumbs-only --force` — rebuild every thumbnail, replacing each as it is made
+- `--thumbs-only --staged` — rebuild the whole set into `thumbnails.new/` and swap it in at the end, so the gallery is never half one look and half another (implies `--force`)
 - `--sample 8` — preview 8 thumbnails into `_render_test/`, changing nothing else
 - `--compare-engines 6` — render 6 small models with both engines, side by side
 - `--jobs N` — render workers (default: about half your cores)
@@ -183,7 +185,9 @@ python update_catalog.py --thumbs-only --force           # apply it to what you 
 
 `--set-style` writes the choice into `rules.local.json` — your file, gitignored, never overwritten by an update. Override `background`, `model`, `ambient`, `specular`, `rim` or `rim_color` in that same block if you want something of your own.
 
-Note that changing the look means re-rendering everything, which is the slowest thing this tool does.
+Note that changing the look means re-rendering everything, which is the slowest thing this tool does. `--thumbs-only --force` replaces each picture as it is made, so for the hour it runs the gallery is half the old look and half the new. `--thumbs-only --staged` (menu option 17) renders the complete new set into `thumbnails.new/` first and swaps it in at the end — a metadata-only rename per file, so the gallery changes over in seconds. Your current pictures are untouched throughout, Ctrl+C changes nothing at all, and re-running resumes rather than starting the hour again. It costs disk for a second copy while it runs.
+
+Neither one ever deletes a thumbnail. A picture that fails to re-render keeps the one you already had.
 
 ## Cloud storage (Dropbox, OneDrive, Google Drive)
 

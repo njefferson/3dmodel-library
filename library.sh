@@ -70,7 +70,8 @@ menu() {
 
   PICTURES
     6   Make thumbnails for items that have none
-    7   Throw away all thumbnails and make them again
+    7   Redo every thumbnail, replacing each as it is made
+   17   Redo every thumbnail, swapping them all in at the end
    16   Change how thumbnails look
 
   FOLDERS AND FILES
@@ -166,9 +167,10 @@ while :; do
         echo "  Ctrl+C is safe - finished ones are kept, it resumes."; echo
         run --thumbs-only --engine mesh; pause ;;
     7)  clear 2>/dev/null || true; echo
-        echo "  Rebuilds EVERY thumbnail from scratch."
-        echo "  Only worth doing if the current pictures look wrong."
-        echo "  Takes a long time. Ctrl+C is safe and it resumes."; echo
+        echo "  Rebuilds EVERY thumbnail, replacing each one as it is made."
+        echo "  Nothing is deleted: a picture that fails to re-render keeps the"
+        echo "  one you already had. Option 17 does the same without the gallery"
+        echo "  being half-changed while it runs."; echo
         if ask "Type Y to continue:"; then
             clear 2>/dev/null || true; echo
             run --thumbs-only --force --engine mesh; pause
@@ -238,6 +240,17 @@ while :; do
         run --duplicates 20
         [ -f potential_duplicates.csv ] && echo "  Spreadsheet:  potential_duplicates.csv"
         pause ;;
+    17) clear 2>/dev/null || true; echo
+        echo "  Rebuilds every thumbnail into a separate folder first, then swaps"
+        echo "  the whole set in at the end. Your current pictures stay exactly as"
+        echo "  they are while it runs, so the gallery is never half one look and"
+        echo "  half another - and Ctrl+C changes nothing at all."; echo
+        echo "  Costs disk for a second copy while it runs, and takes as long as"
+        echo "  option 7 does. Re-running resumes where it stopped."; echo
+        if ask "Type Y to continue:"; then
+            clear 2>/dev/null || true; echo
+            run --thumbs-only --staged --engine mesh; pause
+        fi ;;
     16) clear 2>/dev/null || true
         cat <<'EOF'
 

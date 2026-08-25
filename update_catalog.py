@@ -41,6 +41,10 @@ LIB = os.path.abspath(os.environ.get("LIBRARY_DIR") or SCRIPT_DIR)
 CATALOG = os.path.join(LIB, "catalog.json")
 CSVFILE = os.path.join(LIB, "catalog.csv")
 THUMBS  = os.path.join(LIB, "thumbnails")
+# Where a staged rebuild renders. The live thumbnails are never touched until a
+# complete new set exists, so the gallery stays usable AND self-consistent
+# throughout rather than being half one look and half another for an hour.
+THUMBS_NEW = os.path.join(LIB, "thumbnails.new")
 BACKUPS = os.path.join(LIB, "backups")
 
 def _ensure_dirs():
@@ -1003,14 +1007,15 @@ def _thumb_for(it, out_path, engine="shell"):
 
 _ENGINE="shell"
 _TIMEOUT=0.0            # seconds a single render may take; 0 = no limit
-def _init_worker(engine, timeout=0.0, style=None):
-    global _ENGINE,_TIMEOUT,_STYLE_NAME
-    _ENGINE=engine; _TIMEOUT=timeout; _STYLE_NAME=style
+_OUTDIR=None            # None means the live thumbnails folder
+def _init_worker(engine, timeout=0.0, style=None, outdir=None):
+    global _ENGINE,_TIMEOUT,_STYLE_NAME,_OUTDIR
+    _ENGINE=engine; _TIMEOUT=timeout; _STYLE_NAME=style; _OUTDIR=outdir
 
 def render_one(it):
     """Pool worker. Uses the module-global engine (set via pool initializer). Never raises."""
     try:
-        st,detail,extra=_thumb_for(it, os.path.join(THUMBS, it["id"]+".webp"), _ENGINE)
+        st,detail,extra=_thumb_for(it, os.path.join(_OUTDIR or THUMBS, it["id"]+".webp"), _ENGINE)
         return (it["id"], st, detail, extra)
     except Exception as e:
         return (it["id"], "failed", f"{type(e).__name__}: {e}"[:160], None)
@@ -1170,7 +1175,7 @@ class _Ticker:
 
 _POOL_POLL=0.05
 
-def _render_pool(targets, jobs, engine, timeout, on_done, on_progress=None, pool_factory=None):
+def _render_pool(targets, jobs, engine, timeout, on_done, on_progress=None, pool_factory=None):  # noqa: C901
     """Render in a worker pool with a deadline the PARENT enforces.
 
     A per-render timeout used to be signal.SIGALRM, which does not exist on Windows,
@@ -1192,7 +1197,8 @@ def _render_pool(targets, jobs, engine, timeout, on_done, on_progress=None, pool
     import multiprocessing as mp
     def default_factory():
         return mp.Pool(jobs, initializer=_init_worker,
-                       initargs=(engine, max(5.0, timeout*0.9) if timeout else 0.0, _STYLE_NAME))
+                       initargs=(engine, max(5.0, timeout*0.9) if timeout else 0.0,
+                                 _STYLE_NAME, _OUTDIR))
     make=pool_factory or default_factory
     pool=make(); pending=list(targets); inflight={}
     finished=0; timed_out=0; restarted=0
@@ -1238,19 +1244,50 @@ def _render_pool(targets, jobs, engine, timeout, on_done, on_progress=None, pool
         except Exception: pass
     return timed_out, restarted
 
+def staged_count():
+    if not os.path.isdir(THUMBS_NEW): return 0
+    return sum(1 for f in os.listdir(THUMBS_NEW) if f.endswith(".webp"))
+
+def commit_staged_thumbs():
+    """Move a finished staged rebuild into place. os.replace per file, so each card
+    flips whole, and the swap is metadata only — seconds, not the hour the
+    rendering took. Returns how many moved."""
+    if not os.path.isdir(THUMBS_NEW): return 0
+    os.makedirs(THUMBS, exist_ok=True)
+    moved=0; failed=0
+    for name in sorted(os.listdir(THUMBS_NEW)):
+        if not name.endswith(".webp"): continue
+        try:
+            os.replace(os.path.join(THUMBS_NEW,name), os.path.join(THUMBS,name)); moved+=1
+        except OSError as e:
+            failed+=1
+            if failed<=3: print(f"  [warning] could not move {name}: {e}")
+    try: os.rmdir(THUMBS_NEW)
+    except OSError: pass
+    return moved
+
 def render_missing(items, checkpoint=None, force=False, jobs=1, engine="shell", max_mb=1500,
-                   timeout=300.0):
+                   timeout=300.0, staged=False):
     _ensure_dirs()
-    global _ENGINE,_TIMEOUT          # used by the in-process path (render_one reads them)
+    global _ENGINE,_TIMEOUT,_OUTDIR  # used by the in-process path (render_one reads them)
     _ENGINE=engine; _TIMEOUT=max(5.0,timeout*0.9) if timeout else 0.0
+    _OUTDIR=THUMBS_NEW if staged else None
+    outdir=_OUTDIR or THUMBS
+    if staged:
+        os.makedirs(THUMBS_NEW, exist_ok=True)
+        force=True                   # staging only ever means "rebuild the lot"
+        checkpoint=None              # nothing visible changes until the swap
     idmap={it["id"]:it for it in items if it.get("type") in ("project","archive")}
     targets=[]; pending_total=0
     for it in items:
         if it.get("type") not in ("project","archive"): continue
-        if not force and os.path.exists(os.path.join(THUMBS,it["id"]+".webp")):
-            it["thumbnail"]=it["id"]+".webp"
-            if it.get("thumb_status") not in OK_STATUS: it["thumb_status"]="existing"
-            it.pop("thumb_error",None)
+        # A staged run skips whatever is ALREADY staged, so an interrupted rebuild
+        # picks up where it stopped instead of starting the hour again.
+        if os.path.exists(os.path.join(outdir,it["id"]+".webp")) and (staged or not force):
+            if not staged:
+                it["thumbnail"]=it["id"]+".webp"
+                if it.get("thumb_status") not in OK_STATUS: it["thumb_status"]="existing"
+                it.pop("thumb_error",None)
             continue
         pending_total+=1
         st,why=_skip_status(it)
@@ -1279,6 +1316,14 @@ def render_missing(items, checkpoint=None, force=False, jobs=1, engine="shell", 
               f"(run with --max-mb 99999 to include them).", flush=True)
     print(f"  {pending_total} item(s) need a thumbnail; {total} downloaded & renderable now, "
           f"{cloud} not renderable yet{' (FORCE re-render)' if force else ''}.", flush=True)
+    if staged:
+        already=staged_count()
+        print(f"  STAGED REBUILD — rendering into {os.path.basename(THUMBS_NEW)}{chr(47)}.", flush=True)
+        print( "  Your current pictures are not touched and the gallery keeps working,", flush=True)
+        print( "  all in one look, until a complete new set exists and is swapped in.", flush=True)
+        if already:
+            print(f"  {already:,} already staged from an earlier run — carrying on from there.", flush=True)
+        print( "  Ctrl+C is safe: nothing visible changes, and re-running resumes.\n", flush=True)
     print(f"  Rendering with {jobs} core(s), engine='{engine}', "
           f"{('giving up on any one model after '+_dur(timeout)) if timeout else 'no time limit per model'}.",
           flush=True)
@@ -1330,6 +1375,15 @@ def render_missing(items, checkpoint=None, force=False, jobs=1, engine="shell", 
     finally:
         ticker.stop()
     if total: ticker.emit()
+    if staged:
+        # Only now, with the whole set rendered, does anything visible change.
+        moved=commit_staged_thumbs()
+        print(f"\n  swapped {moved:,} new picture(s) into place; the gallery changes look "
+              "now, all at once.", flush=True)
+        left=staged_count()
+        if left:
+            print(f"  ({left:,} left staged in {os.path.basename(THUMBS_NEW)} — "
+                  "re-run to finish them.)", flush=True)
     if timed_out:
         print(f"\n  {timed_out} model(s) hit the {_dur(timeout)} limit and were abandoned"
               + (f"; {restarted} other render(s) were restarted as a result" if restarted else "")
@@ -2174,6 +2228,7 @@ def build_parser():
     ap.add_argument("--thumbs-only",action="store_true")
     ap.add_argument("--diagnose",action="store_true")
     ap.add_argument("--force",action="store_true",help="re-render thumbnails even if they already exist (hydrated files only)")
+    ap.add_argument("--staged",action="store_true",help="rebuild every thumbnail into thumbnails.new/ and swap them in together at the end, so the gallery never shows a half-changed set (implies --force)")
     ap.add_argument("--sample",type=int,default=0,metavar="N",help="render N sample thumbnails into _render_test/ for review; changes nothing else")
     ap.add_argument("--jobs",type=int,default=0,metavar="N",help="parallel render workers (default: auto = ~half your CPU cores; use 1 to force single core)")
     ap.add_argument("--engine",choices=["shell","mesh"],default="shell",help="thumbnail engine: 'shell' = fast Windows handler like Explorer (default), 'mesh' = slow Python renderer")
@@ -2278,7 +2333,7 @@ def main():
         def _ckpt():
             write_catalog(by_id); write_gallery(by_id)   # gallery is browsable mid-run
         n=render_missing(list(by_id.values()), checkpoint=_ckpt, force=a.force, jobs=jobs,
-                         engine=a.engine, max_mb=a.max_mb, timeout=a.timeout)
+                         engine=a.engine, max_mb=a.max_mb, timeout=a.timeout, staged=a.staged)
         write_catalog(by_id)
         print("refreshing gallery.html and print-tracker-import.json ...", flush=True)
         write_gallery(by_id); write_import(by_id)
@@ -2306,7 +2361,9 @@ Or use these directly:
   --diagnose                 what's downloaded, what's left, is the renderer OK
   --compare-engines 6        6 small models, both engines, side by side
   --thumbs-only              make MISSING thumbnails      (add --engine mesh)
-  --thumbs-only --force      redo ALL thumbnails
+  --thumbs-only --force      redo ALL thumbnails, replacing each as it is made
+  --thumbs-only --staged     ...or build the whole new set first, then swap it
+                             in at once, so the gallery is never half-changed
   --rebuild-views            refresh gallery + csv only, no rendering (fast)
   "D:\\some\\folder"          add/rescan a folder into the library
   --relocate                 fix entries whose files moved (keeps thumbnails)

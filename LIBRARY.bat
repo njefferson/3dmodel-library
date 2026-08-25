@@ -23,7 +23,8 @@ echo    15   Find kits you have more than one copy of
 echo.
 echo   PICTURES
 echo     6   Make thumbnails for items that have none
-echo     7   Throw away all thumbnails and make them again
+echo     7   Redo every thumbnail, replacing each as it is made
+echo    17   Redo every thumbnail, swapping them all in at the end
 echo    16   Change how thumbnails look
 echo.
 echo   FOLDERS AND FILES
@@ -60,6 +61,7 @@ if "%c%"=="13" goto reclass
 if "%c%"=="14" goto unmatched
 if "%c%"=="15" goto dupes
 if "%c%"=="16" goto theme
+if "%c%"=="17" goto staged
 if /i "%c%"=="R" goto refresh
 if /i "%c%"=="B" goto backup
 if /i "%c%"=="U" goto restore
@@ -180,10 +182,29 @@ echo.
 python update_catalog.py --thumbs-only --engine mesh
 goto pause
 
+:staged
+cls & echo.
+echo   Rebuilds every thumbnail into a separate folder first, then swaps the
+echo   whole set in at the end. Your current pictures stay exactly as they
+echo   are while it runs, so the gallery is never half one look and half
+echo   another - and Ctrl+C changes nothing at all.
+echo.
+echo   Costs disk space for a second copy while it runs, and takes as long
+echo   as option 7 does. Re-running resumes where it stopped.
+echo.
+set "y="
+set /p "y=  Type Y to continue: "
+if /i not "%y%"=="Y" goto menu
+cls & echo.
+python update_catalog.py --thumbs-only --staged --engine mesh
+goto pause
+
 :redo
 cls & echo.
-echo   Rebuilds EVERY thumbnail from scratch.
-echo   Only worth doing if the current pictures look wrong.
+echo   Rebuilds EVERY thumbnail, replacing each one as it is made.
+echo   Nothing is deleted: a picture that fails to re-render keeps the
+echo   one you already had. Option 17 does the same without the gallery
+echo   being half-changed while it runs.
 echo   Takes 20-40 minutes. Ctrl+C is safe and it resumes.
 echo.
 set "y="

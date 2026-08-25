@@ -1068,6 +1068,85 @@ class TestDuplicates(LibraryCase):
         self.assertIn("No duplicate kits found", out)
 
 
+class TestStagedRebuild(LibraryCase):
+    """A plain --force rebuild replaces each picture as it is made, so for the hour
+    it runs the gallery is half the old look and half the new. A staged rebuild
+    renders the whole new set first and swaps it in at once."""
+
+    def thumbs(self, folder="thumbnails"):
+        d = os.path.join(self.lib, folder)
+        return sorted(f for f in os.listdir(d)) if os.path.isdir(d) else []
+
+    def seed(self):
+        """A catalog with real, recognisable pictures already in place."""
+        self.scan()
+        os.makedirs(os.path.join(self.lib, "thumbnails"), exist_ok=True)
+        marks = {}
+        for p in self.projects():
+            path = os.path.join(self.lib, "thumbnails", p["id"] + ".webp")
+            with open(path, "wb") as fp: fp.write(b"OLD-" + p["id"].encode())
+            marks[p["id"]] = b"OLD-" + p["id"].encode()
+        return marks
+
+    def test_the_live_pictures_are_untouched_while_it_renders(self):
+        marks = self.seed()
+        with mock.patch.object(uc, "commit_staged_thumbs", return_value=0):   # stop before the swap
+            self.run_cli("--thumbs-only", "--staged", "--jobs", "1")
+        for tid, mark in marks.items():
+            live = os.path.join(self.lib, "thumbnails", tid + ".webp")
+            with open(live, "rb") as fp:
+                self.assertEqual(fp.read(), mark, "a live picture changed mid-rebuild")
+        self.assertTrue(self.thumbs("thumbnails.new"), "nothing was staged")
+
+    def test_the_swap_replaces_everything_at_once_and_clears_the_staging(self):
+        marks = self.seed()
+        out = self.run_cli("--thumbs-only", "--staged", "--jobs", "1")
+        self.assertIn("STAGED REBUILD", out)
+        self.assertIn("swapped", out)
+        for tid, mark in marks.items():
+            with open(os.path.join(self.lib, "thumbnails", tid + ".webp"), "rb") as fp:
+                self.assertNotEqual(fp.read(), mark, "a picture was never replaced")
+        self.assertFalse(os.path.isdir(os.path.join(self.lib, "thumbnails.new")),
+                         "the staging folder was left behind")
+
+    def test_an_interrupted_rebuild_leaves_the_gallery_exactly_as_it_was(self):
+        marks = self.seed()
+        with mock.patch.object(uc, "_render_pool", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    uc.render_missing(list(self.projects()), jobs=1, engine="mesh", staged=True)
+        for tid, mark in marks.items():
+            with open(os.path.join(self.lib, "thumbnails", tid + ".webp"), "rb") as fp:
+                self.assertEqual(fp.read(), mark, "an interrupt changed a live picture")
+
+    def test_it_resumes_instead_of_starting_the_hour_again(self):
+        self.seed()
+        staged = os.path.join(self.lib, "thumbnails.new")
+        os.makedirs(staged, exist_ok=True)
+        done = self.projects()[0]["id"]
+        with open(os.path.join(staged, done + ".webp"), "wb") as fp: fp.write(b"STAGED-ALREADY")
+        rendered = []
+        real = uc._thumb_for
+        def spy(it, out_path, engine="shell"):
+            rendered.append(it["id"]); return real(it, out_path, engine)
+        with mock.patch.object(uc, "_thumb_for", spy):
+            self.run_cli("--thumbs-only", "--staged", "--jobs", "1")
+        self.assertNotIn(done, rendered, "re-rendered something already staged")
+
+    def test_a_plain_force_rebuild_still_never_deletes_anything(self):
+        """The menu used to call this 'throw away all thumbnails'. It does not:
+        each file is replaced whole, and a failure keeps the old picture."""
+        marks = self.seed()
+        with mock.patch.object(uc, "_render", return_value=(False, "nope")), \
+             mock.patch.object(uc, "_shell_thumb", return_value=False):
+            self.run_cli("--thumbs-only", "--force", "--jobs", "1")
+        for tid, mark in marks.items():
+            live = os.path.join(self.lib, "thumbnails", tid + ".webp")
+            self.assertTrue(os.path.exists(live), "a failed rebuild deleted a picture")
+            with open(live, "rb") as fp:
+                self.assertEqual(fp.read(), mark, "a failed rebuild damaged a picture")
+
+
 class TestThemeChoice(LibraryCase):
     """A theme a user can only set by reading the README is a theme most users
     never find. This is the menu path: pick, look, keep."""
