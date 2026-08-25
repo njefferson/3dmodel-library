@@ -17,14 +17,17 @@ charset-normalizer>=3.0
 # Windows, so pip installs it here without needing a compiler.
 fast-simplification>=0.1.7
 
-# Optional — thumbnails for .step / .stp. CAD files are boundary representation,
-# not triangles, so they need a kernel to tessellate; cascadio is OpenCascade's
-# reader as a ~0.5 MB wheel rather than the several hundred megabytes a full CAD
-# install costs, and it converts a 22 KB STEP in about 0.01s. Left out of the
-# default install only because its wheels are 64-bit x86/ARM, and a platform
-# without one would fail this whole file. Without it, .step files are reported as
-# unsupported and the message names this line:
-#     pip install cascadio
+# Thumbnails for .step / .stp. CAD files are boundary representation rather than
+# triangles, so they need a kernel to tessellate; cascadio is OpenCascade's reader
+# as a ~0.5 MB wheel, not the several hundred megabytes a full CAD install costs,
+# and it converts a 22 KB STEP in about 0.01s.
+#
+# The marker is spelled out rather than using `in "x86_64 AMD64 ..."`, because that
+# is a SUBSTRING test: 32-bit Windows reports x86, which matches inside x86_64 and
+# would have pip try to build OpenCascade from source on a machine with no wheel.
+# Where no wheel exists this is simply skipped, and .step files then report
+# themselves as unsupported with `pip install cascadio` in the message.
+cascadio>=0.1.1; platform_machine == "x86_64" or platform_machine == "AMD64" or platform_machine == "arm64" or platform_machine == "aarch64"
 
 # Windows only — lets the tool try Windows' own thumbnail handler first.
 # Safe to omit; the tool falls back to its own renderer.

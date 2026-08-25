@@ -667,6 +667,63 @@ class TestCadFiles(unittest.TestCase):
             self.assertEqual(uc._unrenderable(), uc.CAD_EXT)
 
 
+class TestRequirements(unittest.TestCase):
+    """A package the tool needs but does not declare is found only by hitting the
+    failure it causes. networkx and charset-normalizer were both discovered that
+    way, on a real 2,600-item run, as bare ModuleNotFoundErrors."""
+
+    REQ = os.path.join(ROOT, "requirements.txt")
+
+    # import name -> the name pip installs it under
+    NEEDED = {"numpy": "numpy", "trimesh": "trimesh", "matplotlib": "matplotlib",
+              "PIL": "pillow", "networkx": "networkx",
+              "charset_normalizer": "charset-normalizer",
+              "fast_simplification": "fast-simplification", "cascadio": "cascadio"}
+
+    def lines(self):
+        return [l.strip() for l in read(self.REQ).splitlines()
+                if l.strip() and not l.strip().startswith("#")]
+
+    def declared(self):
+        return {re.split(r"[<>=;\[ ]", l, 1)[0].strip().lower() for l in self.lines()}
+
+    def test_everything_the_tool_imports_is_declared(self):
+        missing = {mod: dist for mod, dist in self.NEEDED.items()
+                   if dist.lower() not in self.declared()}
+        self.assertFalse(missing, f"imported at runtime but not in requirements.txt: {missing}")
+
+    def test_no_requirement_uses_a_substring_platform_test(self):
+        """`platform_machine in "x86_64 AMD64"` is a SUBSTRING test: 32-bit Windows
+        reports x86, which matches inside x86_64, and pip would then try to build
+        from source on a machine with no wheel."""
+        for line in self.lines():
+            self.assertNotRegex(line, r'platform_machine\s+in\s',
+                                f"substring platform test in: {line}")
+
+    def test_every_line_is_a_valid_requirement(self):
+        try:
+            from packaging.requirements import Requirement
+        except ImportError:
+            self.skipTest("packaging not available")
+        for line in self.lines():
+            Requirement(line)          # raises if the line or its marker is malformed
+
+    def test_the_cad_reader_is_installed_where_a_wheel_exists(self):
+        try:
+            from packaging.requirements import Requirement
+        except ImportError:
+            self.skipTest("packaging not available")
+        cad = [Requirement(l) for l in self.lines()
+               if l.lower().startswith("cascadio")]
+        self.assertEqual(len(cad), 1, "cascadio is not declared exactly once")
+        marker = cad[0].marker
+        self.assertTrue(marker, "cascadio has no platform marker")
+        for machine, expected in (("AMD64", True), ("x86_64", True), ("arm64", True),
+                                  ("aarch64", True), ("x86", False), ("i686", False)):
+            got = marker.evaluate({"platform_machine": machine, "sys_platform": "win32"})
+            self.assertEqual(got, expected, f"{machine} should be {expected}")
+
+
 class TestTicker(unittest.TestCase):
 
     def test_it_fires_on_a_timer_with_nothing_happening(self):

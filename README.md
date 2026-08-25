@@ -40,6 +40,8 @@ cd 3dmodel-library
 pip install -r requirements.txt
 ```
 
+That installs everything, including the STEP reader and the mesh simplifier — both matter, and neither announces itself if missing except through worse-looking thumbnails.
+
 ## Quick start
 
 Tell it where your models live:
@@ -232,13 +234,7 @@ The included `.gitignore` excludes all of it, plus `sources.txt` and `backups/`.
 ## Known limitations
 
 - Killing a stuck render means killing the worker pool, so anything else being rendered at that moment is restarted from scratch. Rare, and the alternative was one bad model stalling the whole run.
-- `.step`/`.stp` thumbnails need one extra package. CAD files are boundary representation rather than triangles, so something has to tessellate them:
-
-```bash
-pip install cascadio
-```
-
-  That is OpenCascade's reader as a ~0.5 MB wheel, not a full CAD install, and it converts a 22 KB STEP in about 0.01s. It is left out of `requirements.txt` only because its wheels are 64-bit x86/ARM and a platform without one would fail the whole file. Without it, `.step` files are reported as `unsupported` with that command in the message. With it, they render like anything else — including inside a `.zip`.
+- `.step`/`.stp` thumbnails come from `cascadio`, which `requirements.txt` installs. CAD files are boundary representation rather than triangles, so something has to tessellate them; that package is OpenCascade's reader as a ~0.5 MB wheel, not a full CAD install, and it converts a 22 KB STEP in about 0.01s. On the rare platform with no wheel for it (32-bit, older ARM) pip skips it, and `.step` files then report themselves as `unsupported` with `pip install cascadio` in the message.
 - `.rar` and `.7z` archives are indexed by name only — nothing here can read them.
 - Classification is keyword-based, so it is approximate. It reads the folder path first and the filenames inside as a fallback; it never opens a file to see what the model actually is. Edit `rules.json`, check with `--unmatched`, and apply with `--reclassify`.
 - The two menus are kept in step by a test that checks both against the real argument parser: neither can call a flag that does not exist, and neither can gain an option the other lacks.
