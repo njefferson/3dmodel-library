@@ -7,6 +7,13 @@ and that the paths nobody had ever executed do what they claim.
 
     python -m unittest discover -s tests -v
 
+ONE TRAP, WRITTEN DOWN BECAUSE IT HAS NOW CAUGHT THREE TESTS: patching a module
+global and then letting the work cross into a worker process only works where
+multiprocessing forks. On Windows and macOS it spawns, the child re-imports the
+module, and the patch is silently absent — so the test measures the real code
+while claiming to measure the fake. Either call the function directly, or force
+the in-process path (see TestProgressKeepsTalking.render_in_process).
+
 The library the tests build lives in a temp folder (LIBRARY_DIR), so nothing is
 written next to the script and no real catalog is ever touched.
 """
@@ -785,14 +792,22 @@ class TestNothingFailsSilently(LibraryCase):
 
     def test_a_step_file_nothing_can_read_says_how_to_fix_it(self):
         """Without a CAD reader installed, .step is named as unsupported and the
-        message says what to install — not left as an unexplained blank."""
+        message says what to install — not left as an unexplained blank.
+
+        _thumb_for is called directly rather than through a scan: the scan renders
+        in worker processes, and where multiprocessing uses spawn — Windows and
+        macOS — the child re-imports the module and never sees this patch, so with
+        cascadio really installed it would report 'failed' instead. That is not a
+        hypothetical; it is what turned the Windows CI leg red."""
         self.add_kit("Bracket CAD", ["bracket.step"])
-        with mock.patch.object(uc, "_cad_reader", lambda: None):
-            self.scan()
+        self.scan()
         cad = [p for p in self.projects() if "Bracket" in p["path"]][0]
-        self.assertEqual(cad["thumb_status"], "unsupported")
-        self.assertIn(".step", cad["thumb_error"])
-        self.assertIn("cascadio", cad["thumb_error"])
+        with mock.patch.object(uc, "_cad_reader", lambda: None):
+            status, detail, _extra = uc._thumb_for(
+                cad, os.path.join(self.lib, "cad.webp"), engine="mesh")
+        self.assertEqual(status, "unsupported")
+        self.assertIn(".step", detail)
+        self.assertIn("cascadio", detail)
 
 
 class TestCloudSafety(LibraryCase):
