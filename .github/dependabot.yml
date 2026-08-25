@@ -1,0 +1,37 @@
+# Pin what executes, then keep the pins current.
+#
+# SHA-pinning an action makes it safe but frozen; without this file the pins
+# quietly rot and stop receiving security fixes. Dependabot updates the SHA and
+# the trailing version comment together.
+#
+# zizmor is deliberately absent here. Its version and hashes are pinned in the
+# hub (njefferson/noahjefferson, .github/requirements-ci.txt) and this repo
+# installs from that file in CI rather than carrying its own copy, so a bump
+# there moves every repo at once. Forking the pin would mean this repo silently
+# auditing with a different build.
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "Keep a build tool up to date"
+    labels:
+      - dependencies
+
+  # The tool's own dependencies. These are what actually run against your model
+  # files, so a known-vulnerable one matters more here than the CI tooling does.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "Keep a dependency up to date"
+    labels:
+      - dependencies
+    groups:
+      runtime:
+        patterns:
+          - "*"

@@ -185,7 +185,9 @@ class TestScanProgress(LibraryCase):
         finally:
             os.chmod(blocked, 0o755)
         self.assertEqual(len(self.projects()), 2, "the readable kits should still be there")
-        if os.geteuid() != 0:          # root can read it anyway
+        # chmod 000 does not stop a Windows directory being listed, and root
+        # can read it anyway — in both cases there is nothing to assert
+        if sys.platform != "win32" and getattr(os, "geteuid", lambda: 0)() != 0:
             self.assertIn("could not be read", out)
 
 
@@ -268,37 +270,52 @@ class TestProgressKeepsTalking(LibraryCase):
             return (True, None)
         return render
 
+    def render_in_process(self, seconds, buf):
+        """Force the in-process fallback instead of the worker pool.
+
+        Not a convenience: patching a module global cannot reach a worker where
+        multiprocessing uses spawn rather than fork, which is Windows and macOS,
+        so a patched renderer would silently be the REAL one there and this test
+        would pass or fail for the wrong reason. The ticker is parent-side in
+        both paths, so this measures the same thing everywhere — and covers the
+        fallback path, which had no test at all."""
+        return (mock.patch.object(uc, "_render_pool", side_effect=RuntimeError("no pool")),
+                mock.patch.object(uc, "_render", self.slow_render(seconds)),
+                mock.patch.object(uc, "_shell_thumb", return_value=False),
+                contextlib.redirect_stdout(buf))
+
+    def clear_thumbs(self, items):
+        for it in items:
+            t = os.path.join(self.lib, "thumbnails", it["id"] + ".webp")
+            if os.path.exists(t): os.remove(t)
+
     def test_a_single_slow_render_still_reports_while_it_runs(self):
         self.scan()
         items = self.projects()
-        for it in items:                      # start from nothing rendered
-            t = os.path.join(self.lib, "thumbnails", it["id"] + ".webp")
-            if os.path.exists(t): os.remove(t)
+        self.clear_thumbs(items)
         uc._PROGRESS_EVERY = 0.05
         buf = io.StringIO()
         try:
-            with mock.patch.object(uc, "_render", self.slow_render(0.4)), \
-                 mock.patch.object(uc, "_shell_thumb", return_value=False), \
-                 contextlib.redirect_stdout(buf):
+            with contextlib.ExitStack() as stack:
+                for cm in self.render_in_process(0.4, buf): stack.enter_context(cm)
                 uc.render_missing(items, jobs=1, engine="mesh")
         finally:
             uc._PROGRESS_EVERY = 2.0
-        lines = [l for l in buf.getvalue().splitlines() if "done (" in l]
+        out = buf.getvalue()
+        self.assertIn("rendering in", out, "did not take the in-process path")
+        lines = [l for l in out.splitlines() if "done (" in l]
         self.assertGreater(len(lines), len(items),
                            "fewer progress lines than items — still reporting per completion")
 
     def test_it_says_when_nothing_has_finished_for_a_while(self):
         self.scan()
         items = self.projects()
-        for it in items:
-            t = os.path.join(self.lib, "thumbnails", it["id"] + ".webp")
-            if os.path.exists(t): os.remove(t)
+        self.clear_thumbs(items)
         uc._PROGRESS_EVERY, uc._STALL_NOTICE = 0.05, 0.2
         buf = io.StringIO()
         try:
-            with mock.patch.object(uc, "_render", self.slow_render(0.5)), \
-                 mock.patch.object(uc, "_shell_thumb", return_value=False), \
-                 contextlib.redirect_stdout(buf):
+            with contextlib.ExitStack() as stack:
+                for cm in self.render_in_process(0.5, buf): stack.enter_context(cm)
                 uc.render_missing(items, jobs=1, engine="mesh")
         finally:
             uc._PROGRESS_EVERY, uc._STALL_NOTICE = 2.0, 60.0

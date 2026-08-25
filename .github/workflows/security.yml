@@ -1,0 +1,64 @@
+name: Workflow security audit
+
+# zizmor audits the workflows themselves: unpinned actions, template injection,
+# credential persistence, cache poisoning. Maintained and off the shelf, because
+# a hand-written version of this is one more thing to own and the evidence says
+# it is worse — in the hub, a hand-rolled pinning checker passed clean while
+# zizmor found 23 real findings in the same files.
+#
+# Two flags below are not defaults and both are deliberate. See the hub's
+# SECURITY.md, which is canonical for this.
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"        # weekly: a clean repo does not stay clean by itself
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The zizmor pin lives in the hub and is installed from there rather than
+      # copied, so every repo is audited by the same build and one Dependabot PR
+      # moves them all. A forked pin is a repo quietly auditing with a different
+      # tool than it thinks. (The hub is public; if that ever changes, this step
+      # needs a token.)
+      - name: Check out the hub for the pinned tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: njefferson/noahjefferson
+          path: hub
+          persist-credentials: false
+
+      # `pip install zizmor` resolves to whatever PyPI serves that morning —
+      # the same mutable-pointer problem as an unpinned action tag.
+      # --require-hashes rejects a swapped artefact; --only-binary stops a
+      # silent fall back to building the sdist from source.
+      - name: Install zizmor (version- and hash-pinned)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zizmor"
+          "$RUNNER_TEMP/zizmor/bin/pip" install --quiet --only-binary=:all: \
+            --require-hashes -r hub/.github/requirements-ci.txt
+
+      # --strict-collection turns an unparseable workflow into a FAILURE. By
+      # default zizmor logs "failed to parse input", skips that file, and still
+      # exits 0 printing "No findings to report. Good job!" — so the workflow
+      # most likely to be wrong is the one that never gets audited.
+      - name: Audit the workflows
+        run: |
+          "$RUNNER_TEMP/zizmor/bin/zizmor" --offline --strict-collection \
+            .github/workflows/

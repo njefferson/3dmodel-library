@@ -228,6 +228,10 @@ Builds a catalog from a fixture of tiny STLs in a temp folder and checks the out
 
 Set `LIBRARY_DIR` to keep the catalog, thumbnails and backups somewhere other than next to the script; that is how the tests stay clear of a real library.
 
+CI runs the suite on **Windows as well as Linux** on every push and pull request. That matters more than it sounds: this is a Windows-first tool whose Windows-specific paths — the shell thumbnail engine, the cloud-placeholder attribute check, `spawn`-based multiprocessing — could not be executed at all while it was written. A second workflow audits the workflows themselves with `zizmor`, installed version- and hash-pinned from the hub so every repo is audited by the same build.
+
+One gap, stated rather than hidden: there is no Python-version matrix, so the "Python 3.9+" claim above is untested. Pinning `actions/setup-python` by SHA needs a verified SHA, and an unpinned tag was not an option in the same change that adds an audit for exactly that.
+
 ---
 
 ## Privacy
