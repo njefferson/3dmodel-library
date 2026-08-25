@@ -24,6 +24,7 @@ echo.
 echo   PICTURES
 echo     6   Make thumbnails for items that have none
 echo     7   Throw away all thumbnails and make them again
+echo    16   Change how thumbnails look
 echo.
 echo   FOLDERS AND FILES
 echo     8   Add a folder to the library
@@ -58,6 +59,7 @@ if "%c%"=="12" goto prune
 if "%c%"=="13" goto reclass
 if "%c%"=="14" goto unmatched
 if "%c%"=="15" goto dupes
+if "%c%"=="16" goto theme
 if /i "%c%"=="R" goto refresh
 if /i "%c%"=="B" goto backup
 if /i "%c%"=="U" goto restore
@@ -85,6 +87,39 @@ if /i not "%y%"=="Y" goto menu
 cls & echo.
 python update_catalog.py --restore-backup
 python update_catalog.py --rebuild-views
+goto pause
+
+:theme
+cls & echo.
+echo   COLOUR SCHEMES
+echo     slate      the default - pale grey-blue on charcoal
+echo     paper      warm grey on off-white
+echo     blueprint  blue on deep navy
+echo     bronze     warm metal on near-black
+echo     mono       plain grey on black
+echo     resin      pale green on charcoal
+echo.
+set "t="
+set /p "t=  Which one? (or press Enter to cancel): "
+if not defined t goto menu
+cls & echo.
+echo   Rendering 6 samples in "%t%" so you can look before committing.
+echo   Nothing else is touched.
+echo.
+python update_catalog.py --sample 6 --style %t%
+if exist "_render_test\preview.html" start "" "_render_test\preview.html"
+echo.
+set "y="
+set /p "y=  Keep this scheme for future pictures? Type Y: "
+if /i not "%y%"=="Y" goto menu
+python update_catalog.py --set-style %t%
+echo.
+echo   Pictures you already have keep the old look until they are rebuilt.
+set "y="
+set /p "y=  Rebuild them all now? That takes a while. Type Y: "
+if /i not "%y%"=="Y" goto pause
+cls & echo.
+python update_catalog.py --thumbs-only --force --engine mesh
 goto pause
 
 :dupes
@@ -253,6 +288,11 @@ echo.
 echo   11 The catalog stores where files were. If you reorganise, this
 echo      matches moved folders by their contents and updates them,
 echo      keeping the same thumbnail so nothing is re-rendered.
+echo.
+echo   16 Changes the colour scheme used for rendered thumbnails.
+echo      You see samples first, and the choice is remembered in
+echo      rules.local.json - your own file, never overwritten by
+echo      an update.
 echo.
 echo   15 Lists kits whose contents are identical - the same model
 echo      downloaded twice. Reports only; nothing is ever deleted.

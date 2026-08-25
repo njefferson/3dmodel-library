@@ -71,6 +71,7 @@ menu() {
   PICTURES
     6   Make thumbnails for items that have none
     7   Throw away all thumbnails and make them again
+   16   Change how thumbnails look
 
   FOLDERS AND FILES
     8   Add a folder to the library
@@ -122,6 +123,11 @@ help_screen() {
   14 Shows what the rules did not recognise, and the filenames
      inside those folders - the raw material for writing
      patterns. Prints names only, never full paths.
+
+  16 Changes the colour scheme used for rendered thumbnails.
+     You see samples first, and the choice is remembered in
+     rules.local.json - your own file, never overwritten by
+     an update.
 
   15 Lists kits whose contents are identical - the same model
      downloaded twice. Reports only; nothing is ever deleted.
@@ -231,6 +237,37 @@ while :; do
         echo "  touches your model folders - deciding what to remove is yours."; echo
         run --duplicates 20
         [ -f potential_duplicates.csv ] && echo "  Spreadsheet:  potential_duplicates.csv"
+        pause ;;
+    16) clear 2>/dev/null || true
+        cat <<'EOF'
+
+  COLOUR SCHEMES
+    slate      the default - pale grey-blue on charcoal
+    paper      warm grey on off-white
+    blueprint  blue on deep navy
+    bronze     warm metal on near-black
+    mono       plain grey on black
+    resin      pale green on charcoal
+
+EOF
+        printf '  Which one? (or press Enter to cancel): '
+        read -r theme || continue
+        [ -n "$theme" ] || continue
+        clear 2>/dev/null || true; echo
+        echo "  Rendering 6 samples in \"$theme\" so you can look before committing."
+        echo "  Nothing else is touched."; echo
+        run --sample 6 --style "$theme" || { pause; continue; }
+        [ -f _render_test/preview.html ] && reveal _render_test/preview.html
+        echo
+        if ask "Keep this scheme for future pictures? Type Y:"; then
+            run --set-style "$theme"
+            echo
+            echo "  Pictures you already have keep the old look until rebuilt."
+            if ask "Rebuild them all now? That takes a while. Type Y:"; then
+                clear 2>/dev/null || true; echo
+                run --thumbs-only --force --engine mesh
+            fi
+        fi
         pause ;;
     r|R) clear 2>/dev/null || true; echo
          echo "  Rebuilding gallery and spreadsheet..."; echo

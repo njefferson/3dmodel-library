@@ -171,21 +171,66 @@ LOCAL_RULES=os.path.join(LIB,"rules.local.json")
 # script's own folder unless that library has its own copy.
 _RULE_FILES=[LOCAL_RULES, RULES_FILE, os.path.join(SCRIPT_DIR,"rules.json")]
 _RULES=None
+def _read_rules(path):
+    try:
+        with open(path,encoding="utf-8") as fp:
+            data=json.load(fp)
+        return data if isinstance(data,dict) else None
+    except Exception as e:
+        print(f"  [warning] {os.path.basename(path)} could not be read ({e}).")
+        print( "            Using neutral defaults - fix the file or delete it.")
+        return None
+
 def rules():
-    """Load rules.local.json if present, else rules.json. Missing/broken -> {} so
-    everything still runs with neutral behaviour instead of crashing."""
+    """rules.json, with rules.local.json laid over the top key by key.
+
+    The local file used to REPLACE the shipped one outright, which is a trap: a
+    local file setting nothing but a colour scheme would silently switch off every
+    category, faction and type rule, and nothing would say so. Overriding one
+    top-level key now leaves the rest alone. A key given locally still replaces
+    the whole of that key — writing "categories" locally means yours, not yours
+    merged into the shipped ones, which is what rewriting categories should do.
+    Missing or broken files leave neutral behaviour rather than crashing."""
     global _RULES
     if _RULES is None:
         _RULES={}
-        for p in _RULE_FILES:
+        for p in (RULES_FILE, os.path.join(SCRIPT_DIR,"rules.json")):
             if os.path.exists(p):
-                try:
-                    with open(p,encoding="utf-8") as fp: _RULES=json.load(fp)
-                    break
-                except Exception as e:
-                    print(f"  [warning] {os.path.basename(p)} could not be read ({e}).")
-                    print( "            Using neutral defaults - fix the file or delete it.")
+                data=_read_rules(p)
+                if data is not None: _RULES=data
+                break
+        if os.path.exists(LOCAL_RULES):
+            local=_read_rules(LOCAL_RULES)
+            if local: _RULES={**_RULES, **local}
     return _RULES
+
+def set_style(name):
+    """Write the chosen scheme into rules.local.json, keeping whatever else that
+    file holds. It is gitignored and lays over rules.json, so the shipped
+    classification rules are never touched by a theme choice."""
+    data={}
+    if os.path.exists(LOCAL_RULES):
+        try:
+            with open(LOCAL_RULES,encoding="utf-8") as fp:
+                data=json.load(fp)
+            if not isinstance(data,dict): data={}
+        except (ValueError,OSError) as e:
+            print(f"{os.path.basename(LOCAL_RULES)} could not be read ({e}).")
+            print("Fix or delete it first — I am not going to overwrite it blind.")
+            return False
+    st=data.get("thumbnail_style")
+    st=dict(st) if isinstance(st,dict) else {}
+    st["preset"]=name
+    data["thumbnail_style"]=st
+    data.setdefault("_comment",
+                    "Your local overrides. Laid over rules.json key by key, and "
+                    "gitignored. Delete this file to go back to the shipped rules.")
+    atomic_write(LOCAL_RULES, json.dumps(data, indent=2)+"\n")
+    print(f"\nThumbnail scheme set to '{name}' in {os.path.basename(LOCAL_RULES)}.")
+    print("Everything rendered from now on uses it. Pictures you already have keep")
+    print("the old look until you rebuild them:")
+    print("   python update_catalog.py --thumbs-only --force")
+    return True
 
 def _clean(d):
     """dict from rules.json minus the _comment helper keys"""
@@ -2135,7 +2180,8 @@ def build_parser():
     ap.add_argument("--rebuild-views",action="store_true",help="regenerate catalog.csv/json, gallery.html and the import file from existing data — no rendering")
     ap.add_argument("--max-mb",type=float,default=1500,metavar="MB",help="skip projects larger than this (default 1500). Use a huge number to include everything.")
     ap.add_argument("--timeout",type=float,default=300,metavar="SECONDS",help="give up on any single model after this long and move on (default 300; 0 = no limit)")
-    ap.add_argument("--style",choices=style_names(),default=None,help="colour scheme for rendered thumbnails (default: slate, or whatever rules.json sets)")
+    ap.add_argument("--style",choices=style_names(),default=None,help="colour scheme for rendered thumbnails, for this run only (default: slate, or whatever the rules say)")
+    ap.add_argument("--set-style",choices=style_names(),default=None,metavar="NAME",help="remember a colour scheme in rules.local.json, so every later run uses it")
     ap.add_argument("--compare-engines",type=int,default=0,metavar="N",help="render N SMALL models with BOTH engines side by side into _engine_test/ (fast; changes nothing else)")
     ap.add_argument("--prune",action="store_true",help="remove catalog entries whose files no longer exist (after move-detection runs)")
     ap.add_argument("--relocate",action="store_true",help="re-check every entry's path and fix ones that moved (no scan, no rendering)")
@@ -2156,6 +2202,8 @@ def main():
     _ensure_dirs()
     if a.style:
         global _STYLE_NAME; _STYLE_NAME=a.style
+    if a.set_style:
+        set_style(a.set_style); return
     jobs = a.jobs if a.jobs>0 else min(6, max(1,(os.cpu_count() or 2)-1))
     if a.restore_backup is not None:
         restore_backup(a.restore_backup or None); return
@@ -2273,6 +2321,7 @@ Or use these directly:
 Useful extras:  --jobs N (cores)   --max-mb N (skip huge)   --engine shell|mesh
                 --timeout N (give up on one model after N seconds, default 300)
                 --style NAME   (slate | paper | blueprint | bronze | mono | resin)
+                --set-style NAME  remember that scheme for every later run
 """.strip()); return
     added=updated=0
     print("\nScanning reads names and sizes only — nothing is opened, so nothing gets\n"

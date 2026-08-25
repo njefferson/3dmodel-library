@@ -873,8 +873,13 @@ class TestReclassify(LibraryCase):
     def test_editing_the_rules_reclassifies_without_a_rescan(self):
         self.scan()
         with open(os.path.join(self.lib, "rules.local.json"), "w", encoding="utf-8") as fp:
+            # factions and the wargaming keywords are switched off explicitly:
+            # rules.local.json lays OVER rules.json, so anything not named here is
+            # still the shipped rule, and a shipped faction match would otherwise
+            # send these into the wargaming category before categories are consulted
             json.dump({"categories": {"Titans": "warhound|titan"},
-                       "default_category": "Everything else"}, fp)
+                       "default_category": "Everything else",
+                       "factions": {}, "wargaming_keywords": ""}, fp)
         importlib.reload(uc)
         self.run_cli("--reclassify")
         cats = {p["name"]: p["category"] for p in self.projects()}
@@ -1044,6 +1049,60 @@ class TestDuplicates(LibraryCase):
         self.scan()
         out = self.run_cli("--duplicates")
         self.assertIn("No duplicate kits found", out)
+
+
+class TestThemeChoice(LibraryCase):
+    """A theme a user can only set by reading the README is a theme most users
+    never find. This is the menu path: pick, look, keep."""
+
+    def local_rules(self):
+        return json.loads(read(os.path.join(self.lib, "rules.local.json")))
+
+    def test_setting_a_scheme_writes_it_where_the_next_run_will_read_it(self):
+        out = self.run_cli("--set-style", "blueprint")
+        self.assertIn("blueprint", out)
+        self.assertIn("--thumbs-only --force", out)          # says how to apply it
+        self.assertEqual(self.local_rules()["thumbnail_style"]["preset"], "blueprint")
+        importlib.reload(uc)
+        self.assertEqual(uc._style()["background_hex"],
+                         uc.THUMB_PRESETS["blueprint"]["background"])
+
+    def test_a_theme_choice_does_not_switch_off_the_classification_rules(self):
+        """rules.local.json lays over rules.json. It used to replace it outright, so
+        a local file holding nothing but a colour would have silently disabled every
+        category and faction rule — and nothing would have said so."""
+        self.scan()
+        before = {p["name"]: p["category"] for p in self.projects()}
+        self.assertIn("Warhammer 40k / wargaming", before.values())
+        self.run_cli("--set-style", "bronze")
+        importlib.reload(uc)
+        self.run_cli("--reclassify")
+        after = {p["name"]: p["category"] for p in self.projects()}
+        self.assertEqual(before, after, "picking a colour changed how things classify")
+
+    def test_it_keeps_whatever_else_is_already_in_the_local_file(self):
+        with open(os.path.join(self.lib, "rules.local.json"), "w", encoding="utf-8") as fp:
+            json.dump({"default_category": "Mine", "thumbnail_style": {"ambient": 0.9}}, fp)
+        self.run_cli("--set-style", "mono")
+        local = self.local_rules()
+        self.assertEqual(local["default_category"], "Mine")
+        self.assertEqual(local["thumbnail_style"]["ambient"], 0.9)   # kept
+        self.assertEqual(local["thumbnail_style"]["preset"], "mono")  # and added
+
+    def test_a_broken_local_file_is_not_overwritten_blind(self):
+        path = os.path.join(self.lib, "rules.local.json")
+        with open(path, "w", encoding="utf-8") as fp: fp.write("{ this is not json")
+        out = self.run_cli("--set-style", "paper")
+        self.assertIn("not going to overwrite it blind", out)
+        self.assertEqual(read(path), "{ this is not json")
+
+    def test_an_unknown_scheme_is_refused(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.run_cli("--set-style", "chartreuse", expect_exit=2)   # argparse says no
+        self.assertIn("invalid choice", err.getvalue())
+        self.assertFalse(os.path.exists(os.path.join(self.lib, "rules.local.json")),
+                         "a rejected name still wrote a rules file")
 
 
 class TestRelocateAndPrune(LibraryCase):
