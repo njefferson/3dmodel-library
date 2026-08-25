@@ -1,21 +1,21 @@
 # Core — needed to render thumbnails from mesh files
-trimesh>=4.0
-numpy>=1.24
-pillow>=10.0
-matplotlib>=3.7
+trimesh>=5.0.0
+numpy>=2.5.2
+pillow>=12.3.0
+matplotlib>=3.11.1
 
 # trimesh imports these lazily and does NOT install them itself, so without them
 # some models fail at load time with a bare ModuleNotFoundError. Found by a real
 # run: networkx killed every .3mf, charset-normalizer killed assorted .stl files.
-networkx>=3.0
-charset-normalizer>=3.0
+networkx>=3.6.1
+charset-normalizer>=3.5.1
 
 # Required, not optional. trimesh's own simplify_quadric_decimation() is built on
 # top of this, so without it BOTH reduction paths fail and a high-poly sculpt
 # falls back to keeping every Nth triangle — which scatters the surface into
 # loose specks instead of simplifying it. Wheels exist for CPython 3.10-3.14 on
 # Windows, so pip installs it here without needing a compiler.
-fast-simplification>=0.1.7
+fast-simplification>=0.2.0
 
 # Thumbnails for .step / .stp. CAD files are boundary representation rather than
 # triangles, so they need a kernel to tessellate; cascadio is OpenCascade's reader
@@ -31,4 +31,4 @@ cascadio>=0.1.1; platform_machine == "x86_64" or platform_machine == "AMD64" or 
 
 # Windows only — lets the tool try Windows' own thumbnail handler first.
 # Safe to omit; the tool falls back to its own renderer.
-pywin32>=306; sys_platform == "win32"
+pywin32>=312; sys_platform == "win32"
