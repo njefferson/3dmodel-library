@@ -65,7 +65,7 @@ You can skip the commands entirely — double-click **`LIBRARY.bat`** on Windows
 BROWSE           1  gallery          2  spreadsheet
 CHECK (safe)     3  status           4  scanned folders   5  test 6 thumbnails
                 14  what the rules missed   15  find duplicates
-PICTURES         6  make missing     7  redo all
+PICTURES         6  make missing     7  redo all      16  change the look
 FOLDERS/FILES    8  add folder       9  stop scanning    10  find new files
                 11  fix moved       12  remove dead entries
                 13  re-apply rules
@@ -104,7 +104,8 @@ back.
 - `--max-mb N` — skip projects bigger than this (default 1500)
 - `--timeout N` — give up on any single model after N seconds and move on (default 300; `0` = no limit)
 - `--engine shell|mesh` — thumbnail engine (see below)
-- `--style NAME` — colour scheme for rendered thumbnails: `slate` (default), `paper`, `blueprint`, `bronze`, `mono`, `resin`
+- `--style NAME` — colour scheme for this run only: `slate` (default), `paper`, `blueprint`, `bronze`, `mono`, `resin`
+- `--set-style NAME` — remember that scheme, so every later run uses it
 
 **When things move or go wrong**
 
@@ -170,13 +171,17 @@ Surfaces are shaded from averaged vertex normals rather than per-face ones, so a
 
 **Multi-part kits.** Most downloaded kits are laid out on a print plate — every part authored where it sits on the bed, nowhere near the others. Drawing all of them together gives a picture of scattered specks rather than of the model. When a kit's whole envelope is more than 2.5x its largest single part, the parts are taken to be laid out rather than assembled and the largest part is drawn on its own, with the reason recorded. Kits that genuinely fit together are drawn whole. Change the threshold with `"render_spread_limit"` in `rules.json`.
 
-Six colour schemes ship: `slate` (default), `paper`, `blueprint`, `bronze`, `mono`, `resin`. Try one before committing to a full re-render:
+Six colour schemes ship: `slate` (default), `paper`, `blueprint`, `bronze`, `mono`, `resin`.
+
+**Menu option 16** is the whole flow: pick one, look at six samples rendered in it, then keep it. Or by hand:
 
 ```bash
-python update_catalog.py --sample 6 --style blueprint
+python update_catalog.py --sample 6 --style blueprint    # look first, changes nothing
+python update_catalog.py --set-style blueprint           # remember it
+python update_catalog.py --thumbs-only --force           # apply it to what you have
 ```
 
-Then apply it with `--thumbs-only --force --style blueprint`. Set `"preset"` under `thumbnail_style` in `rules.json` to make a choice stick, and override `background`, `model`, `ambient`, `specular`, `rim` or `rim_color` individually there if you want something of your own.
+`--set-style` writes the choice into `rules.local.json` — your file, gitignored, never overwritten by an update. Override `background`, `model`, `ambient`, `specular`, `rim` or `rim_color` in that same block if you want something of your own.
 
 Note that changing the look means re-rendering everything, which is the slowest thing this tool does.
 
@@ -211,7 +216,7 @@ python update_catalog.py --reclassify --dry-run   # what would change
 python update_catalog.py --reclassify             # do it
 ```
 
-That reads the catalog and rewrites the labels in it. No folder is walked, no model file is opened, no thumbnail is re-made. Put your own patterns in `rules.local.json` instead if you would rather not edit the shipped file — it wins where it exists, and it is gitignored.
+That reads the catalog and rewrites the labels in it. No folder is walked, no model file is opened, no thumbnail is re-made. Put your own patterns in `rules.local.json` if you would rather not edit the shipped file. It is **laid over** `rules.json` key by key, so overriding one thing leaves the rest alone — and it is gitignored, so an update never touches it. A key you do give locally replaces the whole of that key: writing `categories` there means yours, not yours merged into the shipped ones. Note that `factions` are consulted before `categories`, so to re-categorise wargaming models you need `"factions": {}` and `"wargaming_keywords": ""` alongside.
 
 ## Tests
 
