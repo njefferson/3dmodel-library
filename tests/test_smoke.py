@@ -618,6 +618,55 @@ class TestMenusMatchTheTool(unittest.TestCase):
         self.assertIn("3D PRINT LIBRARY", run.stdout)
 
 
+STEP_FIXTURE = os.path.join(ROOT, "tests", "fixtures", "bracket.step")
+try:
+    import cascadio            # noqa: F401
+    HAVE_CAD = True
+except Exception:
+    HAVE_CAD = False
+
+
+@unittest.skipUnless(HAVE_RENDER and HAVE_CAD, "needs trimesh and cascadio")
+class TestCadFiles(unittest.TestCase):
+    """CAD is boundary representation, not triangles, so it needs a kernel to
+    tessellate. cascadio is OpenCascade's reader as a half-megabyte wheel."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="3dlib-cad-")
+        self.assertTrue(os.path.isfile(STEP_FIXTURE), "the STEP fixture is missing")
+
+    def tearDown(self):
+        uc._STYLE_NAME = None
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_a_step_file_renders(self):
+        out = os.path.join(self.tmp, "cad.webp")
+        ok, note = uc._render([STEP_FIXTURE], out)
+        self.assertTrue(ok, note)
+        self.assertGreater(os.path.getsize(out), 0)
+
+    def test_a_step_file_inside_a_zip_renders(self):
+        import zipfile
+        z = os.path.join(self.tmp, "cad.zip")
+        with zipfile.ZipFile(z, "w") as zf:
+            zf.write(STEP_FIXTURE, "parts/bracket.step")
+        status, detail, extra = uc._zip_thumb(z, os.path.join(self.tmp, "z.webp"))
+        self.assertEqual(status, "mesh", detail)
+        self.assertEqual(extra["part_count"], 1)
+
+    def test_a_file_that_only_pretends_to_be_step_fails_with_a_reason(self):
+        bogus = os.path.join(self.tmp, "not-really.step")
+        with open(bogus, "wb") as fp: fp.write(b"this is not a STEP file")
+        ok, why = uc._render([bogus], os.path.join(self.tmp, "x.webp"))
+        self.assertFalse(ok)
+        self.assertTrue(why)
+
+    def test_cad_is_no_longer_listed_as_unrenderable(self):
+        self.assertEqual(uc._unrenderable(), set())
+        with mock.patch.object(uc, "_cad_reader", lambda: None):
+            self.assertEqual(uc._unrenderable(), uc.CAD_EXT)
+
+
 class TestTicker(unittest.TestCase):
 
     def test_it_fires_on_a_timer_with_nothing_happening(self):
@@ -660,12 +709,16 @@ class TestNothingFailsSilently(LibraryCase):
         self.scan("--max-mb", "0.000001")
         self.assertTrue(any(p["thumb_status"] == "too_big" for p in self.projects()))
 
-    def test_step_files_are_catalogued_and_reported_as_unconvertible(self):
+    def test_a_step_file_nothing_can_read_says_how_to_fix_it(self):
+        """Without a CAD reader installed, .step is named as unsupported and the
+        message says what to install — not left as an unexplained blank."""
         self.add_kit("Bracket CAD", ["bracket.step"])
-        self.scan()
+        with mock.patch.object(uc, "_cad_reader", lambda: None):
+            self.scan()
         cad = [p for p in self.projects() if "Bracket" in p["path"]][0]
         self.assertEqual(cad["thumb_status"], "unsupported")
-        self.assertIn("step", cad["thumb_error"])
+        self.assertIn(".step", cad["thumb_error"])
+        self.assertIn("cascadio", cad["thumb_error"])
 
 
 class TestCloudSafety(LibraryCase):

@@ -158,7 +158,7 @@ top of the page. Nothing is skipped silently.
 - **cloud_only** — the files are still online-only placeholders; nothing was opened
 - **missing** — the files are not at the recorded path any more
 - **too_big** — over `--max-mb`, deliberately deferred
-- **unsupported** — `.step`/`.stp`, which nothing here can convert
+- **unsupported** — a CAD file with no reader installed; the message says what to install
 - **failed** — the renderer ran and produced nothing; the reason is recorded alongside it
 - **timeout** — the render ran past `--timeout` and the worker was killed
 
@@ -232,7 +232,13 @@ The included `.gitignore` excludes all of it, plus `sources.txt` and `backups/`.
 ## Known limitations
 
 - Killing a stuck render means killing the worker pool, so anything else being rendered at that moment is restarted from scratch. Rare, and the alternative was one bad model stalling the whole run.
-- `.step`/`.stp` files are catalogued but not thumbnailed — no CAD converter is bundled. They are reported as `unsupported` rather than left blank.
+- `.step`/`.stp` thumbnails need one extra package. CAD files are boundary representation rather than triangles, so something has to tessellate them:
+
+```bash
+pip install cascadio
+```
+
+  That is OpenCascade's reader as a ~0.5 MB wheel, not a full CAD install, and it converts a 22 KB STEP in about 0.01s. It is left out of `requirements.txt` only because its wheels are 64-bit x86/ARM and a platform without one would fail the whole file. Without it, `.step` files are reported as `unsupported` with that command in the message. With it, they render like anything else — including inside a `.zip`.
 - `.rar` and `.7z` archives are indexed by name only — nothing here can read them.
 - Classification is keyword-based, so it is approximate. It reads the folder path first and the filenames inside as a fallback; it never opens a file to see what the model actually is. Edit `rules.json`, check with `--unmatched`, and apply with `--reclassify`.
 - The two menus are kept in step by a test that checks both against the real argument parser: neither can call a flag that does not exist, and neither can gain an option the other lacks.

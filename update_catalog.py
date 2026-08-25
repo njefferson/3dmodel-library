@@ -361,8 +361,20 @@ def _load_meshes(sources):
     for src in sources:
         blob=ext=None; label=None
         if isinstance(src,tuple): blob,ext=src; label=f"<{ext} in archive>"
-        else: label=os.path.basename(src)
+        else: label=os.path.basename(src); ext=os.path.splitext(src)[1]
         try:
+            if (ext or "").lower() in CAD_EXT:
+                # CAD is boundary representation, not triangles. cascadio hands the
+                # tessellation to OpenCascade and gives back glTF, which trimesh
+                # already reads — so a .step joins the normal path from here on,
+                # including one inside a zip, which arrives as bytes anyway.
+                cad=_cad_reader()
+                if cad is None:
+                    if err is None: err=f"{label}: no CAD reader — run: pip install cascadio"
+                    continue
+                if blob is None:
+                    with open(src,"rb") as fp: blob=fp.read()
+                blob=cad.load(blob, file_type="step"); ext=".glb"
             if blob is None:
                 m=trimesh.load(src, force="mesh")
             else:
@@ -874,8 +886,23 @@ def _zip_thumb(src, out_path):
     except Exception as e:
         return ("packed", f"{type(e).__name__}: {e}"[:120], None)
 
-# Catalogued, but nothing bundled here can turn CAD into a picture.
-UNRENDERABLE={".step",".stp"}
+CAD_EXT={".step",".stp"}
+_CAD=None
+def _cad_reader():
+    """cascadio — OpenCascade's STEP reader as a half-megabyte wheel, rather than
+    the several hundred megabytes a full CAD kernel costs. Optional: without it
+    CAD files are reported as unsupported instead of failing, with the fix named."""
+    global _CAD
+    if _CAD is None:
+        try:
+            import cascadio; _CAD=cascadio
+        except Exception:
+            _CAD=False
+    return _CAD or None
+
+def _unrenderable():
+    """Extensions we cannot draw right now — empty once the CAD reader is present."""
+    return set() if _cad_reader() else CAD_EXT
 # Every value thumb_status can hold. OK_STATUS means a picture exists.
 OK_STATUS={"reused","shell","mesh","existing"}
 STATUS_LABEL={
@@ -907,10 +934,12 @@ def _thumb_for(it, out_path, engine="shell"):
     if not hyd:
         if cloud: return ("cloud_only", f"{cloud} part(s) still online-only", None)
         return ("missing", f"{gone} file(s) not found under {it.get('path','')}", None)
-    renderable=[p for p in hyd if os.path.splitext(p)[1].lower() not in UNRENDERABLE]
+    blocked=_unrenderable()
+    renderable=[p for p in hyd if os.path.splitext(p)[1].lower() not in blocked]
     if not renderable:
-        return ("unsupported",
-                "only "+", ".join(sorted({os.path.splitext(p)[1].lower() for p in hyd})), None)
+        kinds=", ".join(sorted({os.path.splitext(p)[1].lower() for p in hyd}))
+        hint=" — run: pip install cascadio" if blocked else ""
+        return ("unsupported", f"only {kinds}{hint}", None)
     best=None; bestsz=-1
     for p in renderable:               # largest hydrated part = most representative
         try: sz=os.path.getsize(p)
@@ -1929,7 +1958,7 @@ def compare_engines(items, n=6, max_mb=60):
         print(f"  [{i}/{len(picked)}] {dn}  ({it.get('part_count') or '?'} parts, {mb:.1f} MB)", flush=True)
         res={}
         hyd,_c,_g=_hydrated_parts(it)     # downloaded parts only — never pull one down
-        renderable=[q for q in hyd if os.path.splitext(q)[1].lower() not in UNRENDERABLE]
+        renderable=[q for q in hyd if os.path.splitext(q)[1].lower() not in _unrenderable()]
         for eng in ("shell","mesh"):
             p=os.path.join(outdir, f"{it['id']}_{eng}.webp")
             ts=time.time(); why=None
