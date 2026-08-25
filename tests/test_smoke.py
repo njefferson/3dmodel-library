@@ -631,6 +631,25 @@ class TestMenusMatchTheTool(unittest.TestCase):
         self.assertEqual(bat - {"q"}, sh - {"q"},
                          "the two menus no longer offer the same numbered options")
 
+    def test_neither_menu_assumes_python_is_on_the_path(self):
+        """A bare `python` fails on a normal Windows install: without "Add Python
+        to PATH" there is no such command, and Windows 10/11 ship a Microsoft Store
+        stub under that name which looks installed and only opens the Store. Both
+        menus must work it out and say what to install if they cannot."""
+        bat = read(self.BAT)
+        self.assertNotRegex(bat, r"(?m)^\s*python3? update_catalog\.py",
+                            "LIBRARY.bat calls a bare python again")
+        for probe in ("py -3", "python", "python3"):
+            self.assertIn(f"call :trypy {probe}", bat, f"{probe} is no longer tried")
+        # tested by RUNNING each candidate, not by looking for the file — `where`
+        # finds the Store stub perfectly well
+        self.assertIn('%* -c "import sys"', bat)
+
+        sh = read(self.SH)
+        self.assertIn("for c in python3 python", sh)
+        for text in (bat, sh):
+            self.assertIn("python.org", text, "no link to what needs installing")
+
     @unittest.skipIf(os.name == "nt", "POSIX shell only")
     def test_the_shell_menu_parses_and_quits_cleanly(self):
         import subprocess

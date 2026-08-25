@@ -13,7 +13,10 @@ for c in python3 python; do
     if command -v "$c" >/dev/null 2>&1; then PY="$c"; break; fi
 done
 if [ -z "$PY" ]; then
-    echo "Python 3 was not found on your PATH. Install it, then run this again."
+    echo "Python was not found."
+    echo
+    echo "This tool needs Python 3.9 or newer:  https://www.python.org/downloads/"
+    echo "Most systems already have it as python3 — check with:  python3 --version"
     exit 1
 fi
 

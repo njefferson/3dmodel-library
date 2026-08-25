@@ -3,6 +3,46 @@ setlocal enabledelayedexpansion
 cd /d "%~dp0"
 title 3D Print Library
 
+REM Find Python once, up front, and say so plainly if it is not there.
+REM
+REM This used to be a bare `python`, which fails on a perfectly normal Windows
+REM install: if "Add Python to PATH" was not ticked there is no `python` at all,
+REM and on Windows 10/11 there is a Microsoft Store STUB at that name which
+REM `where python` happily finds and which then just opens the Store. So each
+REM candidate is TESTED by running it, not by looking for the file, and the
+REM official py launcher is tried first because it is never the stub.
+set "PY="
+call :trypy py -3
+if not defined PY call :trypy python
+if not defined PY call :trypy python3
+if not defined PY goto nopython
+goto menu
+
+:trypy
+if defined PY exit /b
+%* -c "import sys" >nul 2>&1
+if not errorlevel 1 set "PY=%*"
+exit /b
+
+:nopython
+cls
+echo.
+echo   Python was not found.
+echo.
+echo   This tool needs Python 3.9 or newer. Install it from:
+echo       https://www.python.org/downloads/
+echo.
+echo   On the first screen of the installer, TICK "Add python.exe to PATH".
+echo   That box is what this is complaining about; it is easy to miss.
+echo.
+echo   If Python is already installed, open a terminal here and check which
+echo   of these works, then reinstall or repair so one of them does:
+echo       py -3 --version
+echo       python --version
+echo.
+pause
+exit /b 1
+
 :menu
 cls
 echo.
@@ -72,7 +112,7 @@ goto menu
 
 :backup
 cls & echo.
-python update_catalog.py --backup
+%PY% update_catalog.py --backup
 echo.
 echo   Backups kept (newest first):
 dir /b /o-d "backups\*.json" 2>nul | more +0
@@ -87,8 +127,8 @@ set "y="
 set /p "y=  Type Y to continue: "
 if /i not "%y%"=="Y" goto menu
 cls & echo.
-python update_catalog.py --restore-backup
-python update_catalog.py --rebuild-views
+%PY% update_catalog.py --restore-backup
+%PY% update_catalog.py --rebuild-views
 goto pause
 
 :theme
@@ -108,20 +148,20 @@ cls & echo.
 echo   Rendering 6 samples in "%t%" so you can look before committing.
 echo   Nothing else is touched.
 echo.
-python update_catalog.py --sample 6 --style %t%
+%PY% update_catalog.py --sample 6 --style %t%
 if exist "_render_test\preview.html" start "" "_render_test\preview.html"
 echo.
 set "y="
 set /p "y=  Keep this scheme for future pictures? Type Y: "
 if /i not "%y%"=="Y" goto menu
-python update_catalog.py --set-style %t%
+%PY% update_catalog.py --set-style %t%
 echo.
 echo   Pictures you already have keep the old look until they are rebuilt.
 set "y="
 set /p "y=  Rebuild them all now? That takes a while. Type Y: "
 if /i not "%y%"=="Y" goto pause
 cls & echo.
-python update_catalog.py --thumbs-only --force --engine mesh
+%PY% update_catalog.py --thumbs-only --force --engine mesh
 goto pause
 
 :dupes
@@ -130,7 +170,7 @@ echo   Finds kits catalogued more than once and writes the full list to
 echo   potential_duplicates.csv. It DELETES NOTHING and never touches your
 echo   model folders - deciding what to remove is yours to do in Explorer.
 echo.
-python update_catalog.py --duplicates 20
+%PY% update_catalog.py --duplicates 20
 if exist "potential_duplicates.csv" echo   Spreadsheet:  potential_duplicates.csv
 goto pause
 
@@ -139,7 +179,7 @@ cls & echo.
 echo   Lists what none of the rules matched, with the names of the files
 echo   inside, so you can see what patterns are missing. Changes nothing.
 echo.
-python update_catalog.py --unmatched 25
+%PY% update_catalog.py --unmatched 25
 goto pause
 
 :reclass
@@ -148,29 +188,29 @@ echo   Re-labels everything already in the catalog using rules.json as it
 echo   stands now. No folders are scanned and no pictures are re-made.
 echo   You get a preview first; nothing changes until you confirm.
 echo.
-python update_catalog.py --reclassify --dry-run
+%PY% update_catalog.py --reclassify --dry-run
 echo.
 set "y="
 set /p "y=  Apply these changes? Type Y: "
 if /i not "%y%"=="Y" goto menu
 cls & echo.
-python update_catalog.py --reclassify
+%PY% update_catalog.py --reclassify
 goto pause
 
 :status
 cls & echo. & echo   Checking...& echo.
-python update_catalog.py --diagnose
+%PY% update_catalog.py --diagnose
 goto pause
 
 :srcshow
 cls & echo.
-python update_catalog.py --sources
+%PY% update_catalog.py --sources
 echo   You can also open sources.txt in Notepad and edit it directly.
 goto pause
 
 :compare
 cls & echo. & echo   Rendering 6 small models two ways. Takes under a minute.& echo.
-python update_catalog.py --compare-engines 6
+%PY% update_catalog.py --compare-engines 6
 if exist "_engine_test\compare.html" start "" "_engine_test\compare.html"
 goto pause
 
@@ -179,7 +219,7 @@ cls & echo.
 echo   Makes pictures only for items that don't have one.
 echo   Ctrl+C is safe - finished ones are kept, it resumes.
 echo.
-python update_catalog.py --thumbs-only --engine mesh
+%PY% update_catalog.py --thumbs-only --engine mesh
 goto pause
 
 :staged
@@ -196,7 +236,7 @@ set "y="
 set /p "y=  Type Y to continue: "
 if /i not "%y%"=="Y" goto menu
 cls & echo.
-python update_catalog.py --thumbs-only --staged --engine mesh
+%PY% update_catalog.py --thumbs-only --staged --engine mesh
 goto pause
 
 :redo
@@ -211,7 +251,7 @@ set "y="
 set /p "y=  Type Y to continue: "
 if /i not "%y%"=="Y" goto menu
 cls & echo.
-python update_catalog.py --thumbs-only --force --engine mesh
+%PY% update_catalog.py --thumbs-only --force --engine mesh
 goto pause
 
 :addfolder
@@ -223,12 +263,12 @@ set "f="
 set /p "f=  Folder: "
 if not defined f goto menu
 cls & echo.
-python update_catalog.py "%f%" --engine mesh
+%PY% update_catalog.py "%f%" --engine mesh
 goto pause
 
 :srcdel
 cls & echo.
-python update_catalog.py --sources
+%PY% update_catalog.py --sources
 echo.
 echo   Paste the folder to STOP scanning.
 echo   Your files stay. Existing catalog entries stay.
@@ -237,7 +277,7 @@ set "f="
 set /p "f=  Folder: "
 if not defined f goto menu
 cls & echo.
-python update_catalog.py --remove-source "%f%"
+%PY% update_catalog.py --remove-source "%f%"
 goto pause
 
 :rescanall
@@ -249,7 +289,7 @@ set "y="
 set /p "y=  Type Y to continue: "
 if /i not "%y%"=="Y" goto menu
 cls & echo.
-python update_catalog.py --rescan-all --engine mesh
+%PY% update_catalog.py --rescan-all --engine mesh
 goto pause
 
 :relocate
@@ -264,7 +304,7 @@ set "y="
 set /p "y=  Type Y to continue: "
 if /i not "%y%"=="Y" goto menu
 cls & echo.
-python update_catalog.py --relocate
+%PY% update_catalog.py --relocate
 goto pause
 
 :prune
@@ -280,12 +320,12 @@ set "y="
 set /p "y=  Type Y to continue: "
 if /i not "%y%"=="Y" goto menu
 cls & echo.
-python update_catalog.py --relocate --prune
+%PY% update_catalog.py --relocate --prune
 goto pause
 
 :refresh
 cls & echo. & echo   Rebuilding gallery and spreadsheet...& echo.
-python update_catalog.py --rebuild-views
+%PY% update_catalog.py --rebuild-views
 goto pause
 
 :help

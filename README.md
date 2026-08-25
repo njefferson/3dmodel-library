@@ -29,26 +29,40 @@ Explorer shows you one folder at a time and can't tell you that the Warhound tit
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.9 or newer — from [python.org](https://www.python.org/downloads/) on Windows, ticking **"Add python.exe to PATH"** on the installer's first screen
 - A menu is provided for every platform: double-click **`LIBRARY.bat`** on Windows, or run **`./library.sh`** on macOS and Linux. The Python script itself runs anywhere, with or without either.
 
 ## Install
 
-```bash
+**Windows:**
+
+```
 git clone https://github.com/njefferson/3dmodel-library.git
 cd 3dmodel-library
-pip install -r requirements.txt
+py -m pip install -r requirements.txt
+py update_catalog.py --diagnose
 ```
 
-That installs everything, including the STEP reader and the mesh simplifier — both matter, and neither announces itself if missing except through worse-looking thumbnails.
+**macOS and Linux:**
+
+```
+git clone https://github.com/njefferson/3dmodel-library.git
+cd 3dmodel-library
+python3 -m pip install -r requirements.txt
+python3 update_catalog.py --diagnose
+```
+
+That installs everything, including the STEP reader and the mesh simplifier — both matter, and neither announces itself if missing except through worse-looking thumbnails. The last line is the one worth running: `--diagnose` changes nothing and tells you whether the install actually works, before you commit an hour to a scan.
+
+**On the spelling of `python`.** Windows is the awkward one: if "Add Python to PATH" was not ticked during installation there is no `python` command at all, and Windows 10 and 11 ship a Microsoft Store *stub* under that name which looks installed and merely opens the Store. `py` is the official launcher and is never the stub, so it is the reliable spelling there — `python3` elsewhere. The examples further down write plain `python` for brevity; substitute whichever works for you. `LIBRARY.bat` and `library.sh` both work this out for themselves and say what to install if they cannot find anything.
 
 ## Quick start
 
 Tell it where your models live:
 
-```bash
-python update_catalog.py --add-source "D:\path\to\your\models"
-python update_catalog.py --rescan-all
+```
+py update_catalog.py --add-source "D:\path\to\your\models"
+py update_catalog.py --rescan-all
 ```
 
 That scans, classifies, renders thumbnails, and writes `gallery.html`. Open it in any browser.
